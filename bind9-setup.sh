@@ -66,6 +66,10 @@ apt-get update -qq
 apt-get install -y bind9 bind9utils dnsutils certbot curl util-linux
 ok "Packages installed."
 
+# Resolve util paths dynamically after packages are installed
+NAMED_COMPILEZONE_BIN=$(which named-compilezone 2>/dev/null || echo "/usr/sbin/named-compilezone")
+RNDC_BIN=$(which rndc 2>/dev/null || echo "/usr/sbin/rndc")
+
 # ── BIND version check (DoH needs 9.18+) ─────────────────────────────────────
 BIND_VER=$(named -v 2>&1 | grep -oP '(?<=BIND )\d+\.\d+' | head -1)
 BIND_MAJOR=$(cut -d. -f1 <<< "$BIND_VER")
@@ -142,7 +146,7 @@ cp -L "\$RENEWED_LINEAGE/privkey.pem"   "\$BIND_SSL/privkey.pem"
 chown "root:\$BIND_USER" "\$BIND_SSL/fullchain.pem" "\$BIND_SSL/privkey.pem"
 chmod 640                "\$BIND_SSL/fullchain.pem" "\$BIND_SSL/privkey.pem"
 
-rndc reconfig && echo "[\$(date)] BIND reloaded after cert renewal for \$RENEWED_LINEAGE." \
+"$RNDC_BIN" reconfig && echo "[\$(date)] BIND reloaded after cert renewal for \$RENEWED_LINEAGE." \
   || echo "[\$(date)] WARNING: rndc reconfig failed after renewal."
 HOOK
 chmod +x /etc/letsencrypt/renewal-hooks/deploy/bind9-reload.sh
@@ -298,7 +302,7 @@ $TTL 300
   NS  localhost.
 ZONE
 
-    /usr/sbin/named-compilezone -f text -F raw -q \
+    "$NAMED_COMPILEZONE_BIN" -f text -F raw -q \
         -o "$RPZ_RAW_FILE" "rpz.adblock" "$ZONE_TMP" \
       || die "named-compilezone failed on placeholder zone."
     # Touch the txt file so the update script has something to compare against
@@ -335,6 +339,10 @@ if $USE_RPZ; then
 # RPZ adblock zone updater — hagezi/dns-blocklists pro
 # Managed by systemd rpz-updater.service / rpz-updater.timer
 set -euo pipefail
+
+# Dynamic util paths
+NAMED_COMPILEZONE_BIN=$(which named-compilezone 2>/dev/null || echo "/usr/sbin/named-compilezone")
+RNDC_BIN=$(which rndc 2>/dev/null || echo "/usr/sbin/rndc")
 
 URL="https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/rpz/pro.txt"
 ZONE_NAME="rpz.adblock"
@@ -373,7 +381,7 @@ fi
 
 echo "Update detected. Compiling zone..."
 
-if ! /usr/bin/named-compilezone -f text -F raw -q -o "$TEMP_RAW" "$ZONE_NAME" "$TEMP_FILE"; then
+if ! "$NAMED_COMPILEZONE_BIN" -f text -F raw -q -o "$TEMP_RAW" "$ZONE_NAME" "$TEMP_FILE"; then
     echo "Error: Zone compilation failed." >&2
     exit 1
 fi
@@ -384,7 +392,7 @@ chmod 644 "$TEMP_RAW" "$TEMP_FILE"
 mv "$TEMP_RAW" "$RAW_FILE"
 mv "$TEMP_FILE" "$TEXT_FILE"
 
-if /usr/sbin/rndc -k "$KEY_FILE" reload "$ZONE_NAME"; then
+if "$RNDC_BIN" -k "$KEY_FILE" reload "$ZONE_NAME"; then
     echo "Zone $ZONE_NAME reloaded successfully."
 else
     echo "Error: rndc reload failed." >&2
@@ -439,7 +447,7 @@ EOF
 fi
 
 # ── 6. LOGROTATE FOR NAMED ────────────────────────────────────────────────────
-cat > /etc/logrotate.d/named-custom <<'LR'
+cat > /etc/logrotate.d/named-custom <<LR
 /var/log/named/named.log {
     weekly
     rotate 4
@@ -448,7 +456,7 @@ cat > /etc/logrotate.d/named-custom <<'LR'
     notifempty
     create 640 bind bind
     postrotate
-        /usr/sbin/rndc reopen > /dev/null 2>&1 || true
+        $RNDC_BIN reopen > /dev/null 2>&1 || true
     endscript
 }
 LR
