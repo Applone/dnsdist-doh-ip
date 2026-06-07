@@ -175,6 +175,7 @@ build_bind_from_source() {
         build-essential pkg-config xz-utils perl \
         libssl-dev libuv1-dev libcap-dev libnghttp2-dev \
         libxml2-dev libjson-c-dev liburcu-dev libjemalloc-dev \
+        liblmdb-dev libmaxminddb-dev \
         meson ninja-build python3-pip
 
     local work; work=$(mktemp -d)
