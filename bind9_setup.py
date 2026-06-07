@@ -60,6 +60,8 @@ SOURCE_BUILD_DEPS = [
     "libmaxminddb-dev",
     "pkg-config",
     "python3",
+    "meson",
+    "ninja-build",
     "dnsutils",
     "certbot",
     "curl",
@@ -488,28 +490,64 @@ def build_bind_from_source(version: str, prefix: str) -> None:
     src_dir = subdirs[0]
     LOG.info("Source directory: %s", src_dir)
 
-    # Configure
-    LOG.info("Configuring BIND %s (prefix=%s) …", version, prefix)
-    configure_args = [
-        str(src_dir / "configure"),
-        f"--prefix={prefix}",
-        "--sysconfdir=/etc/bind",
-        "--localstatedir=/var",
-        "--with-libnghttp2",
-        "--enable-doh",
-        "--with-openssl",
-        "--disable-linux-caps",
-    ]
-    run_cmd(configure_args, cwd=str(src_dir))
+    # Detect build system: BIND 9.21+ uses meson, older versions use autotools
+    uses_meson = (src_dir / "meson.build").is_file()
+    uses_autotools = (src_dir / "configure").is_file()
 
-    # Build
-    ncpu = os.cpu_count() or 2
-    LOG.info("Building BIND %s (using %d parallel jobs) …", version, ncpu)
-    run_cmd(["make", f"-j{ncpu}"], cwd=str(src_dir))
+    if uses_meson:
+        LOG.info("Detected meson build system (BIND 9.21+)")
 
-    # Install
-    LOG.info("Installing BIND %s to %s …", version, prefix)
-    run_cmd(["make", "install"], cwd=str(src_dir))
+        # Configure via meson setup
+        meson_args = [
+            "meson", "setup", str(src_dir / "builddir"), str(src_dir),
+            f"--prefix={prefix}",
+            "--sysconfdir=/etc/bind",
+            "--localstatedir=/var",
+        ]
+        LOG.info("Configuring BIND %s (meson, prefix=%s) …", version, prefix)
+        run_cmd(meson_args)
+
+        # Build via ninja
+        ncpu = os.cpu_count() or 2
+        LOG.info("Building BIND %s (using %d parallel jobs) …", version, ncpu)
+        run_cmd(["ninja", "-C", str(src_dir / "builddir"), f"-j{ncpu}"])
+
+        # Install
+        LOG.info("Installing BIND %s to %s …", version, prefix)
+        run_cmd(["meson", "install", "-C", str(src_dir / "builddir")])
+
+    elif uses_autotools:
+        LOG.info("Detected autotools build system (BIND ≤9.20)")
+
+        # Configure
+        LOG.info("Configuring BIND %s (prefix=%s) …", version, prefix)
+        configure_args = [
+            str(src_dir / "configure"),
+            f"--prefix={prefix}",
+            "--sysconfdir=/etc/bind",
+            "--localstatedir=/var",
+            "--with-libnghttp2",
+            "--enable-doh",
+            "--with-openssl",
+            "--disable-linux-caps",
+        ]
+        run_cmd(configure_args, cwd=str(src_dir))
+
+        # Build
+        ncpu = os.cpu_count() or 2
+        LOG.info("Building BIND %s (using %d parallel jobs) …", version, ncpu)
+        run_cmd(["make", f"-j{ncpu}"], cwd=str(src_dir))
+
+        # Install
+        LOG.info("Installing BIND %s to %s …", version, prefix)
+        run_cmd(["make", "install"], cwd=str(src_dir))
+
+    else:
+        raise SetupError(
+            f"Cannot determine build system: neither meson.build nor configure "
+            f"found in {src_dir}"
+        )
+
     run_cmd(["ldconfig"])
 
     # Create systemd override if prefix != /usr

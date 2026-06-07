@@ -174,7 +174,8 @@ build_bind_from_source() {
     apt-get install -y \
         build-essential pkg-config xz-utils perl \
         libssl-dev libuv1-dev libcap-dev libnghttp2-dev \
-        libxml2-dev libjson-c-dev liburcu-dev libjemalloc-dev
+        libxml2-dev libjson-c-dev liburcu-dev libjemalloc-dev \
+        meson ninja-build python3-pip
 
     local work; work=$(mktemp -d)
     # shellcheck disable=SC2064
@@ -209,20 +210,44 @@ build_bind_from_source() {
     local src="$work/bind-${ver}"
     [[ -d "$src" ]] || die "Unexpected tarball layout: $src not found."
 
-    local cfg_args=(--with-libnghttp2)
-    if [[ "$prefix" == "/usr" ]]; then
-        cfg_args+=(--prefix=/usr --sysconfdir=/etc --localstatedir=/var)
+    # Detect build system: BIND 9.21+ uses meson, older versions use autotools
+    if [[ -f "$src/meson.build" ]]; then
+        info "Detected meson build system (BIND 9.21+)."
+
+        local meson_args=()
+        if [[ "$prefix" == "/usr" ]]; then
+            meson_args+=(--prefix=/usr --sysconfdir=/etc --localstatedir=/var)
+        else
+            meson_args+=(--prefix="$prefix")
+        fi
+
+        info "Configuring (meson setup ${meson_args[*]}) ..."
+        meson setup "$src/builddir" "$src" "${meson_args[@]}" \
+          || die "meson setup failed — check the build output above."
+
+        info "Compiling (this can take several minutes)..."
+        ninja -C "$src/builddir" -j"$(nproc)" || die "ninja build failed."
+        meson install -C "$src/builddir"       || die "meson install failed."
+    elif [[ -f "$src/configure" ]]; then
+        info "Detected autotools build system (BIND ≤9.20)."
+
+        local cfg_args=(--with-libnghttp2)
+        if [[ "$prefix" == "/usr" ]]; then
+            cfg_args+=(--prefix=/usr --sysconfdir=/etc --localstatedir=/var)
+        else
+            cfg_args+=(--prefix="$prefix")
+        fi
+
+        info "Configuring (${cfg_args[*]}) ..."
+        ( cd "$src" && ./configure "${cfg_args[@]}" ) \
+          || die "./configure failed — check the build output above."
+
+        info "Compiling (this can take several minutes)..."
+        ( cd "$src" && make -j"$(nproc)" ) || die "make failed."
+        ( cd "$src" && make install )      || die "make install failed."
     else
-        cfg_args+=(--prefix="$prefix")
+        die "Cannot determine build system: neither meson.build nor configure found in $src"
     fi
-
-    info "Configuring (${cfg_args[*]}) ..."
-    ( cd "$src" && ./configure "${cfg_args[@]}" ) \
-      || die "./configure failed — check the build output above."
-
-    info "Compiling (this can take several minutes)..."
-    ( cd "$src" && make -j"$(nproc)" ) || die "make failed."
-    ( cd "$src" && make install )      || die "make install failed."
     ldconfig
 
     # When not overwriting /usr, repoint named.service at the built binary and
