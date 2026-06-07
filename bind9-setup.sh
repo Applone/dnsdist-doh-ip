@@ -30,6 +30,24 @@ prompt() {   # prompt "Question" "default" -> reads into $REPLY
     REPLY="${REPLY:-$d}"
 }
 
+# Fallback version list used when the ISC mirror cannot be reached.
+BIND_VERSION_FALLBACK=(9.20.7 9.18.33)
+
+# fetch_bind_versions -> prints available stable BIND9 versions, newest first.
+# Parses the ISC download index; falls back to BIND_VERSION_FALLBACK offline.
+fetch_bind_versions() {
+    local html versions
+    html=$(curl -sS -f --connect-timeout 10 --max-time 30 \
+                https://downloads.isc.org/isc/bind9/ 2>/dev/null || true)
+    # Keep only plain x.y.z directories (drop rc/beta/alpha pre-releases).
+    versions=$(grep -oP '9\.\d+\.\d+(?=/)' <<< "$html" | sort -uVr)
+    if [[ -z "$versions" ]]; then
+        printf '%s\n' "${BIND_VERSION_FALLBACK[@]}"
+        return 1
+    fi
+    printf '%s\n' "$versions"
+}
+
 prompt "Domain for DoT/DoH (e.g. dns.example.com)" ""
 [[ -z "$REPLY" ]] && die "Domain is required."
 DOMAIN="$REPLY"
@@ -49,9 +67,55 @@ fi
 read -rp "  Enable statistics channel on 127.0.0.1:8053? [y/N]: " _stats
 USE_STATS=false; [[ "${_stats,,}" == y* ]] && USE_STATS=true
 
+# ── BIND9 source selection ────────────────────────────────────────────────────
+echo
+echo -e "  ${BOLD}Where should BIND9 come from?${NC}"
+echo "    1) Distro mirror (apt)          — fast, whatever your release ships"
+echo "    2) Build a specific version from ISC source"
+prompt "Choose 1 or 2" "1"
+INSTALL_MODE=distro
+BIND_SRC_VER=""
+BIND_PREFIX="/usr"            # only meaningful in source mode
+if [[ "$REPLY" == 2 ]]; then
+    INSTALL_MODE=source
+
+    info "Fetching available BIND9 versions from downloads.isc.org ..."
+    mapfile -t BIND_VERSIONS < <(fetch_bind_versions) \
+        || warn "Could not reach ISC mirror — offering a built-in fallback list."
+
+    echo
+    echo -e "  ${BOLD}Available BIND9 versions${NC} (newest first):"
+    # Show a trimmed menu — first ~15 entries is plenty.
+    _max=${#BIND_VERSIONS[@]}; (( _max > 15 )) && _max=15
+    for (( i=0; i<_max; i++ )); do
+        printf "    %2d) %s\n" "$((i+1))" "${BIND_VERSIONS[i]}"
+    done
+    prompt "Select a version number (or type an exact version)" "1"
+    if [[ "$REPLY" =~ ^[0-9]+$ ]] && (( REPLY >= 1 && REPLY <= _max )); then
+        BIND_SRC_VER="${BIND_VERSIONS[$((REPLY-1))]}"
+    elif [[ "$REPLY" =~ ^9\.[0-9]+\.[0-9]+$ ]]; then
+        BIND_SRC_VER="$REPLY"      # user typed an exact version
+    else
+        die "Invalid selection: '$REPLY'."
+    fi
+
+    echo
+    read -rp "  Overwrite the distro BIND binaries in /usr? [y/N]: " _ow
+    if [[ "${_ow,,}" == y* ]]; then
+        BIND_PREFIX="/usr"
+    else
+        BIND_PREFIX="/usr/local"
+    fi
+fi
+
 echo
 echo -e "  ${BOLD}Domain:${NC}     $DOMAIN"
 echo -e "  ${BOLD}Forwarders:${NC} $FWD1 / $FWD2"
+if [[ "$INSTALL_MODE" == source ]]; then
+    echo -e "  ${BOLD}BIND9:${NC}      build $BIND_SRC_VER from source (prefix $BIND_PREFIX)"
+else
+    echo -e "  ${BOLD}BIND9:${NC}      distro mirror (apt)"
+fi
 echo -e "  ${BOLD}RPZ:${NC}        $($USE_RPZ && echo "enabled ($RPZ_TIMER)" || echo disabled)"
 echo -e "  ${BOLD}Stats:${NC}      $($USE_STATS && echo enabled || echo disabled)"
 echo
@@ -64,9 +128,97 @@ header "Installing packages"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y bind9 bind9utils dnsutils certbot curl util-linux
-ok "Packages installed."
+ok "Base packages installed."
 
-# Resolve util paths dynamically after packages are installed
+# build_bind_from_source <version> <prefix>
+# Compiles BIND9 from the ISC source tarball with DoH (libnghttp2) support and
+# installs it over the given prefix. The distro bind9 packages remain installed
+# to provide the bind user, /etc/bind skeleton, rndc.key and named.service.
+build_bind_from_source() {
+    local ver="$1" prefix="$2"
+    local base="https://downloads.isc.org/isc/bind9/${ver}"
+    local tarball="bind-${ver}.tar.xz"
+
+    header "Building BIND $ver from source (prefix $prefix)"
+
+    info "Installing build dependencies..."
+    apt-get install -y \
+        build-essential pkg-config xz-utils perl \
+        libssl-dev libuv1-dev libcap-dev libnghttp2-dev \
+        libxml2-dev libjson-c-dev liburcu-dev libjemalloc-dev
+
+    local work; work=$(mktemp -d)
+    # shellcheck disable=SC2064
+    trap "rm -rf '$work'" RETURN
+
+    info "Downloading $tarball ..."
+    curl -sS -f --connect-timeout 10 --max-time 300 \
+         --retry 3 --retry-all-errors --retry-delay 5 \
+         -o "$work/$tarball" "$base/$tarball" \
+      || die "Download failed: $base/$tarball"
+
+    # Verify SHA512 checksum when ISC publishes one (best effort).
+    if curl -sS -f --connect-timeout 10 --max-time 30 \
+            -o "$work/${tarball}.sha512.asc" "$base/${tarball}.sha512.asc" 2>/dev/null; then
+        local want got
+        want=$(grep -oP '[0-9a-f]{128}' "$work/${tarball}.sha512.asc" | head -1)
+        got=$(sha512sum "$work/$tarball" | cut -d' ' -f1)
+        if [[ -n "$want" && "$want" != "$got" ]]; then
+            die "Checksum mismatch for $tarball (expected $want, got $got)."
+        fi
+        if [[ -n "$want" ]]; then
+            ok "Checksum verified."
+        else
+            warn "No checksum found in published file; skipping verification."
+        fi
+    else
+        warn "Could not fetch checksum file; skipping verification."
+    fi
+
+    info "Extracting..."
+    tar -xf "$work/$tarball" -C "$work"
+    local src="$work/bind-${ver}"
+    [[ -d "$src" ]] || die "Unexpected tarball layout: $src not found."
+
+    local cfg_args=(--with-libnghttp2)
+    if [[ "$prefix" == "/usr" ]]; then
+        cfg_args+=(--prefix=/usr --sysconfdir=/etc --localstatedir=/var)
+    else
+        cfg_args+=(--prefix="$prefix")
+    fi
+
+    info "Configuring (${cfg_args[*]}) ..."
+    ( cd "$src" && ./configure "${cfg_args[@]}" ) \
+      || die "./configure failed — check the build output above."
+
+    info "Compiling (this can take several minutes)..."
+    ( cd "$src" && make -j"$(nproc)" ) || die "make failed."
+    ( cd "$src" && make install )      || die "make install failed."
+    ldconfig
+
+    # When not overwriting /usr, repoint named.service at the built binary and
+    # make sure the rest of this script resolves the new tools first.
+    if [[ "$prefix" != "/usr" ]]; then
+        mkdir -p /etc/systemd/system/named.service.d
+        cat > /etc/systemd/system/named.service.d/override.conf <<UNIT
+[Service]
+ExecStart=
+ExecStart=${prefix}/sbin/named -f -u bind
+UNIT
+        systemctl daemon-reload
+        export PATH="${prefix}/sbin:${prefix}/bin:$PATH"
+        hash -r
+        ok "named.service repointed to ${prefix}/sbin/named."
+    fi
+
+    ok "BIND $ver installed: $("${prefix}/sbin/named" -v 2>&1 | head -1)"
+}
+
+if [[ "$INSTALL_MODE" == source ]]; then
+    build_bind_from_source "$BIND_SRC_VER" "$BIND_PREFIX"
+fi
+
+# Resolve util paths dynamically after packages are installed / built
 NAMED_COMPILEZONE_BIN=$(which named-compilezone 2>/dev/null || echo "/usr/sbin/named-compilezone")
 RNDC_BIN=$(which rndc 2>/dev/null || echo "/usr/sbin/rndc")
 
@@ -75,7 +227,7 @@ BIND_VER=$(named -v 2>&1 | grep -oP '(?<=BIND )\d+\.\d+' | head -1)
 BIND_MAJOR=$(cut -d. -f1 <<< "$BIND_VER")
 BIND_MINOR=$(cut -d. -f2 <<< "$BIND_VER")
 info "Detected BIND $BIND_VER"
-if [[ "$BIND_MAJOR" -lt 9 ]] || { [[ "$BIND_MAJOR" -eq 9 ]] && [[ "$BIND_MINOR" -lt 18 ]]; }; then
+if [[ "$INSTALL_MODE" != source ]] && { [[ "$BIND_MAJOR" -lt 9 ]] || { [[ "$BIND_MAJOR" -eq 9 ]] && [[ "$BIND_MINOR" -lt 18 ]]; }; }; then
     warn "BIND $BIND_VER detected — DoH (port 443) requires BIND 9.18+."
     warn "DoT (port 853) will still work. Trying to install bind9 from backports..."
     # Try backports on Debian
@@ -84,8 +236,11 @@ if [[ "$BIND_MAJOR" -lt 9 ]] || { [[ "$BIND_MAJOR" -eq 9 ]] && [[ "$BIND_MINOR" 
         echo "deb http://deb.debian.org/debian ${CODENAME}-backports main" \
             > /etc/apt/sources.list.d/backports.list
         apt-get update -qq
-        apt-get install -y -t "${CODENAME}-backports" bind9 bind9utils 2>/dev/null && \
-            ok "Updated BIND from backports." || warn "Backports install failed; continuing with $BIND_VER."
+        if apt-get install -y -t "${CODENAME}-backports" bind9 bind9utils 2>/dev/null; then
+            ok "Updated BIND from backports."
+        else
+            warn "Backports install failed; continuing with $BIND_VER."
+        fi
     fi
     BIND_VER=$(named -v 2>&1 | grep -oP '(?<=BIND )\d+\.\d+' | head -1)
     BIND_MINOR=$(cut -d. -f2 <<< "$BIND_VER")
@@ -93,8 +248,11 @@ fi
 
 DOH_ENABLED=false
 [[ "$BIND_MAJOR" -ge 9 ]] && [[ "$BIND_MINOR" -ge 18 ]] && DOH_ENABLED=true
-$DOH_ENABLED && ok "DoH support confirmed (BIND $BIND_VER)." \
-             || warn "DoH disabled (BIND $BIND_VER < 9.18). DoT + plain DNS will work."
+if $DOH_ENABLED; then
+    ok "DoH support confirmed (BIND $BIND_VER)."
+else
+    warn "DoH disabled (BIND $BIND_VER < 9.18). DoT + plain DNS will work."
+fi
 
 BIND_USER=$(id -un named 2>/dev/null || echo bind)
 BIND_DIR="/etc/bind"
@@ -528,6 +686,12 @@ echo
 echo -e "  ${BOLD}Plain DNS${NC}   →  ${DOMAIN}:53  (TCP/UDP)"
 echo -e "  ${BOLD}DNS-over-TLS${NC} →  ${DOMAIN}:853"
 $DOH_ENABLED && echo -e "  ${BOLD}DNS-over-HTTPS${NC} →  https://${DOMAIN}/dns-query"
+echo
+if [[ "$INSTALL_MODE" == source ]]; then
+    echo -e "  ${BOLD}BIND9:${NC}      $BIND_VER (built from source, prefix $BIND_PREFIX)"
+else
+    echo -e "  ${BOLD}BIND9:${NC}      $BIND_VER (distro mirror)"
+fi
 echo
 echo -e "  ${BOLD}Config files:${NC}"
 echo -e "    $BIND_DIR/named.conf.options"
