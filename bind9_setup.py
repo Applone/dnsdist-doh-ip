@@ -518,6 +518,23 @@ def build_bind_from_source(version: str, prefix: str) -> None:
         LOG.info("Building BIND %s (using %d parallel jobs) …", version, ncpu)
         run_cmd(["ninja", "-C", str(src_dir / "builddir"), f"-j{ncpu}"])
 
+        # Cleanup old binaries to prevent meson install symlink conflicts
+        LOG.info("Cleaning up old BIND binaries to prevent meson install conflicts …")
+        bind_bins = [
+            "named", "named-checkconf", "named-checkzone", "named-compilezone", "named-journalprint",
+            "named-nzd2nzf", "named-rrchecker", "rndc", "rndc-confgen", "tsig-keygen", "ddns-confgen",
+            "delv", "dig", "host", "nslookup", "nsupdate", "dnssec-cds", "dnssec-dsfromkey",
+            "dnssec-importkey", "dnssec-keyfromlabel", "dnssec-keygen", "dnssec-revoke",
+            "dnssec-settime", "dnssec-signzone", "dnssec-verify", "mdig", "arpaname",
+            "dnstap-read", "nsec3hash"
+        ]
+        for b in bind_bins:
+            for p in (f"{prefix}/bin/{b}", f"{prefix}/sbin/{b}", f"/usr/bin/{b}", f"/usr/sbin/{b}"):
+                try:
+                    Path(p).unlink(missing_ok=True)
+                except OSError:
+                    pass
+
         # Install
         LOG.info("Installing BIND %s to %s …", version, prefix)
         run_cmd(["meson", "install", "-C", str(src_dir / "builddir")])

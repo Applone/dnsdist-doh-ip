@@ -228,6 +228,16 @@ build_bind_from_source() {
 
         info "Compiling (this can take several minutes)..."
         ninja -C "$src/builddir" -j"$(nproc)" || die "ninja build failed."
+
+        info "Cleaning up old BIND binaries to prevent meson install conflicts..."
+        for bin in named named-checkconf named-checkzone named-compilezone named-journalprint \
+                   named-nzd2nzf named-rrchecker rndc rndc-confgen tsig-keygen ddns-confgen \
+                   delv dig host nslookup nsupdate dnssec-cds dnssec-dsfromkey dnssec-importkey \
+                   dnssec-keyfromlabel dnssec-keygen dnssec-revoke dnssec-settime dnssec-signzone \
+                   dnssec-verify mdig arpaname dnstap-read nsec3hash; do
+            rm -f "$prefix/bin/$bin" "$prefix/sbin/$bin" /usr/bin/$bin /usr/sbin/$bin 2>/dev/null || true
+        done
+
         meson install -C "$src/builddir"       || die "meson install failed."
     elif [[ -f "$src/configure" ]]; then
         info "Detected autotools build system (BIND ≤9.20)."
