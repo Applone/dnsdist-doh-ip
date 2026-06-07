@@ -20,6 +20,31 @@ header() { echo -e "\n${BOLD}═════════════════
 [[ $EUID -ne 0 ]]          && die "Run as root (sudo $0)."
 [[ -f /etc/debian_version ]] || die "Only Debian/Ubuntu is supported."
 
+# ── 0. EXISTING BIND9 DETECTION ──────────────────────────────────────────────
+# If BIND9 is already installed, offer to reinstall from source.
+FORCE_SOURCE_REINSTALL=false
+if command -v named &>/dev/null; then
+    EXISTING_BIND=$(named -v 2>&1 | head -1)
+    echo -e "${YELLOW}[WARN]${NC}  Existing BIND9 detected: ${EXISTING_BIND}"
+    read -rp "  Do you want to reinstall BIND9 from source? [y/N]: " _reinstall
+    if [[ "${_reinstall,,}" == y* ]]; then
+        # Check if the existing version was installed via apt
+        if dpkg -l bind9 2>/dev/null | grep -q '^ii'; then
+            info "Existing BIND9 was installed via apt. Removing apt packages first..."
+            systemctl stop named 2>/dev/null || systemctl stop bind9 2>/dev/null || true
+            apt-get remove --purge -y bind9 bind9utils bind9-utils 2>/dev/null || true
+            apt-get autoremove -y 2>/dev/null || true
+            ok "Apt-installed BIND9 packages removed."
+        else
+            info "Existing BIND9 is not from apt (likely a previous source build)."
+            info "The new source build will override it via the systemd unit."
+        fi
+        FORCE_SOURCE_REINSTALL=true
+    else
+        info "Keeping existing BIND9 installation."
+    fi
+fi
+
 # ── 1. INPUT ─────────────────────────────────────────────────────────────────
 header "Configuration"
 
@@ -76,7 +101,11 @@ prompt "Choose 1 or 2" "1"
 INSTALL_MODE=distro
 BIND_SRC_VER=""
 BIND_PREFIX="/usr"            # only meaningful in source mode
-if [[ "$REPLY" == 2 ]]; then
+if [[ "$FORCE_SOURCE_REINSTALL" == true ]]; then
+    INSTALL_MODE=source
+    REPLY=2    # fall through into source selection below
+fi
+if [[ "$REPLY" == 2 ]] || [[ "$INSTALL_MODE" == source ]]; then
     INSTALL_MODE=source
 
     info "Fetching available BIND9 versions from downloads.isc.org ..."

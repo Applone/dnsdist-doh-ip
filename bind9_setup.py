@@ -328,6 +328,93 @@ def compare_versions(v1: str, v2: str) -> int:
     return 0
 
 
+def detect_existing_bind(config: Config) -> tuple[bool, str]:
+    """Check if BIND9 is already installed.
+
+    Returns (is_installed, version_string).
+    """
+    named_bin = shutil.which("named")
+    if not named_bin:
+        return False, ""
+    result = run_cmd([named_bin, "-v"], capture=True, check=False)
+    if result.returncode != 0:
+        return False, ""
+    version_str = result.stdout.strip()
+    LOG.info("Existing BIND9 detected: %s", version_str)
+    return True, version_str
+
+
+def is_bind_from_apt() -> bool:
+    """Check if the currently installed BIND9 came from apt."""
+    result = run_cmd(
+        ["dpkg", "-l", "bind9"],
+        capture=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return False
+    return bool(re.search(r"^ii\s+bind9\s", result.stdout, re.MULTILINE))
+
+
+def remove_apt_bind() -> None:
+    """Remove BIND9 packages installed via apt."""
+    LOG.info("Removing apt-installed BIND9 packages …")
+    # Stop the service first
+    run_cmd(["systemctl", "stop", "named"], check=False)
+    run_cmd(["systemctl", "stop", "bind9"], check=False)
+    env = {**os.environ, "DEBIAN_FRONTEND": "noninteractive"}
+    run_cmd(
+        ["apt-get", "remove", "--purge", "-y", "bind9", "bind9utils", "bind9-utils"],
+        env=env,
+        check=False,
+    )
+    run_cmd(["apt-get", "autoremove", "-y"], env=env, check=False)
+    LOG.info("Apt-installed BIND9 packages removed ✓")
+
+
+def handle_existing_bind(config: Config) -> None:
+    """If BIND9 is already installed, ask the user whether to reinstall from source.
+
+    When the user opts to reinstall:
+    - If the existing install is from apt, purge the apt packages first.
+    - If the existing install is from source (not apt), the new source build
+      will simply override the systemd unit (the scripts already support this).
+    - Forces config.install_mode to 'source'.
+    """
+    is_installed, version_str = detect_existing_bind(config)
+    if not is_installed:
+        return
+
+    LOG.warning("Existing BIND9 installation found: %s", version_str)
+
+    if config.non_interactive:
+        LOG.info("Non-interactive mode — keeping existing BIND9 installation")
+        return
+
+    reinstall = _prompt_yes_no(
+        f"BIND9 is already installed ({version_str}). "
+        "Do you want to reinstall from source?",
+        default=False,
+    )
+    if not reinstall:
+        LOG.info("Keeping existing BIND9 installation")
+        return
+
+    # Check if installed via apt and remove if so
+    if is_bind_from_apt():
+        LOG.info("Existing BIND9 was installed via apt")
+        remove_apt_bind()
+    else:
+        LOG.info(
+            "Existing BIND9 is not from apt (likely a previous source build). "
+            "The new source build will override it via the systemd unit."
+        )
+
+    # Force source mode for the rest of the setup
+    config.install_mode = "source"
+    LOG.info("Install mode forced to 'source' for reinstall")
+
+
 # ---------------------------------------------------------------------------
 # Package installation
 # ---------------------------------------------------------------------------
@@ -1463,6 +1550,11 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--skip-certbot", action="store_true", help="Skip TLS certificate obtainment")
     p.add_argument("--skip-firewall", action="store_true", help="Skip firewall rule configuration")
     p.add_argument("--debug", action="store_true", help="Enable debug logging")
+    p.add_argument(
+        "--reinstall",
+        action="store_true",
+        help="Force reinstall from source even if BIND9 is already installed",
+    )
     return p
 
 
@@ -1497,6 +1589,19 @@ def main() -> None:
     if config.install_mode == "source":
         LOG.info("  BIND version: %s", config.bind_version)
         LOG.info("  Prefix:       %s", config.bind_prefix)
+
+    # ---- Step 1b: Detect existing BIND9 and handle reinstall ----
+    if args.reinstall:
+        config.install_mode = "source"
+        is_installed, version_str = detect_existing_bind(config)
+        if is_installed:
+            LOG.warning("--reinstall: existing BIND9 found: %s", version_str)
+            if is_bind_from_apt():
+                remove_apt_bind()
+            else:
+                LOG.info("Existing BIND9 is not from apt; will override via systemd unit")
+    else:
+        handle_existing_bind(config)
 
     # ---- Step 2: Install packages ----
     try:
