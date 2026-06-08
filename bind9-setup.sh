@@ -58,14 +58,20 @@ prompt() {   # prompt "Question" "default" -> reads into $REPLY
 # Fallback version list used when the ISC mirror cannot be reached.
 BIND_VERSION_FALLBACK=(9.20.7 9.18.33)
 
+# Highest minor release allowed: 9.21+ is a development-only branch, not for production.
+BIND_MAX_MINOR=20
+
 # fetch_bind_versions -> prints available stable BIND9 versions, newest first.
 # Parses the ISC download index; falls back to BIND_VERSION_FALLBACK offline.
 fetch_bind_versions() {
     local html versions
     html=$(curl -sS -f --connect-timeout 10 --max-time 30 \
                 https://downloads.isc.org/isc/bind9/ 2>/dev/null || true)
-    # Keep only plain x.y.z directories (drop rc/beta/alpha pre-releases).
-    versions=$(grep -oP '9\.\d+\.\d+(?=/)' <<< "$html" | sort -uVr)
+    # Keep only plain x.y.z directories (drop rc/beta/alpha pre-releases),
+    # then exclude development branches above BIND_MAX_MINOR (9.21+).
+    versions=$(grep -oP '9\.\d+\.\d+(?=/)' <<< "$html" \
+               | awk -F. -v max="$BIND_MAX_MINOR" '$2 <= max' \
+               | sort -uVr)
     if [[ -z "$versions" ]]; then
         printf '%s\n' "${BIND_VERSION_FALLBACK[@]}"
         return 1
@@ -217,7 +223,7 @@ build_bind_from_source() {
 
         local meson_args=()
         if [[ "$prefix" == "/usr" ]]; then
-            meson_args+=(--prefix=/usr --sysconfdir=/etc --localstatedir=/var)
+            meson_args+=(--prefix=/usr --sysconfdir=/etc/bind --localstatedir=/var)
         else
             meson_args+=(--prefix="$prefix")
         fi
@@ -244,7 +250,7 @@ build_bind_from_source() {
 
         local cfg_args=(--with-libnghttp2)
         if [[ "$prefix" == "/usr" ]]; then
-            cfg_args+=(--prefix=/usr --sysconfdir=/etc --localstatedir=/var)
+            cfg_args+=(--prefix=/usr --sysconfdir=/etc/bind --localstatedir=/var)
         else
             cfg_args+=(--prefix="$prefix")
         fi
@@ -268,7 +274,7 @@ build_bind_from_source() {
         cat > /etc/systemd/system/named.service.d/override.conf <<UNIT
 [Service]
 ExecStart=
-ExecStart=${prefix}/sbin/named -f -u bind
+ExecStart=${prefix}/sbin/named -f -u bind -c /etc/bind/named.conf
 UNIT
         systemctl daemon-reload
         export PATH="${prefix}/sbin:${prefix}/bin:$PATH"
