@@ -249,6 +249,57 @@ def stage_unit() -> tuple[bool, str]:
     return proc.returncode == 0, proc.stdout
 
 
+# Driver run in a fresh interpreter to exercise bind9_setup's real prompt path.
+_CLI_DRIVER = (
+    "import asyncio, bind9_setup as b\n"
+    "async def fv():\n"
+    "    return (['9.20.7'], False)\n"
+    "async def main():\n"
+    "    cfg = b.Config()\n"
+    "    vt = asyncio.ensure_future(fv())\n"
+    "    await b.gather_config(cfg, vt)\n"
+    "    vt.cancel()\n"
+    "    print('CLI_DOMAIN=' + cfg.domain)\n"
+    "asyncio.run(main())\n"
+)
+
+
+def stage_cli_prompts() -> tuple[bool, str]:
+    """Drive bind9_setup.py's interactive prompts to guard against EOF crashes.
+
+    Runs the real input path in a fresh interpreter, both with piped answers and
+    with no input at all, so an EOFError regression fails the suite.
+    """
+    repo = os.path.dirname(os.path.abspath(__file__))
+    env = {**os.environ, "PYTHONPATH": repo}
+    parts: list[str] = []
+
+    # Piped answers must be consumed and produce the expected config.
+    piped = subprocess.run(
+        [sys.executable, "-c", _CLI_DRIVER],
+        input="dns.example.com\n\n\nn\nn\n1\n\n",
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        env=env, start_new_session=True, timeout=120,
+    )
+    parts.append("[piped stdin]\n" + piped.stdout)
+    if piped.returncode != 0 or "CLI_DOMAIN=dns.example.com" not in piped.stdout:
+        return False, "\n".join(parts)
+
+    # No stdin and no controlling terminal must exit gracefully, never with a
+    # raw EOFError traceback (the original crash).
+    eof = subprocess.run(
+        [sys.executable, "-c", _CLI_DRIVER],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, text=True,
+        env=env, start_new_session=True, timeout=120,
+    )
+    parts.append("[no stdin]\n" + eof.stdout)
+    if eof.returncode == 0 or "EOFError" in eof.stdout:
+        return False, "\n".join(parts)
+
+    return True, "\n".join(parts)
+
+
 def stage_integration_apt() -> tuple[bool, str]:
     try:
         return ipod.integration_apt()
@@ -267,6 +318,7 @@ def build_stages(no_podman: bool) -> list[Stage]:
     stages = [
         Stage("Ruff lint", stage_ruff),
         Stage("Unit tests", stage_unit),
+        Stage("Python CLI: prompts", stage_cli_prompts),
     ]
     if not no_podman:
         stages.append(Stage("Podman: apt install", stage_integration_apt))

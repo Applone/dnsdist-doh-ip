@@ -474,16 +474,58 @@ def render_logrotate(rndc_bin: str) -> str:
 
 
 # ── Interactive prompts ──────────────────────────────────────────────────────
-def prompt(question: str, default: str = "") -> str:
+_tty = None
+
+
+def _read_from_tty(prompt_text: str) -> str:
+    """Read a line from the controlling terminal, used when stdin is exhausted.
+
+    Raises EOFError when /dev/tty is unavailable (e.g. no controlling terminal).
+    """
+    global _tty
+    if _tty is None:
+        try:
+            _tty = open("/dev/tty")
+        except OSError as exc:
+            raise EOFError from exc
+    sys.stdout.write(prompt_text)
+    sys.stdout.flush()
+    line = _tty.readline()
+    if not line:
+        raise EOFError
+    return line.rstrip("\n")
+
+
+def _read_line(prompt_text: str) -> str:
+    """Prompt for one line, falling back to /dev/tty when stdin is piped.
+
+    Running via `curl ... | python3` leaves stdin at EOF (the interpreter has
+    already consumed the script), so input() must fall back to the terminal.
+    Raises EOFError when no input source is available at all.
+    """
+    try:
+        return input(prompt_text)
+    except EOFError:
+        return _read_from_tty(prompt_text)
+
+
+async def prompt(question: str, default: str = "") -> str:
     q = question
     if default:
         q += f" [{default}]"
-    reply = input(f"  {q}: ").strip()
+    try:
+        reply = (await asyncio.to_thread(_read_line, f"  {q}: ")).strip()
+    except EOFError:
+        die("No interactive input available. Run this script in a terminal.")
     return reply or default
 
 
-def ask_yes(question: str) -> bool:
-    return input(f"  {question}: ").strip().lower().startswith("y")
+async def ask_yes(question: str) -> bool:
+    try:
+        reply = await asyncio.to_thread(_read_line, f"  {question}: ")
+    except EOFError:
+        die("No interactive input available. Run this script in a terminal.")
+    return reply.strip().lower().startswith("y")
 
 
 def write_file(path: str, content: str, *, mode: int | None = None) -> None:
@@ -501,7 +543,7 @@ async def detect_existing_bind(cfg: Config) -> None:
         return
     _, out = await run("named", "-v", check=False, capture=True)
     warn(f"Existing BIND9 detected: {out.strip().splitlines()[0] if out.strip() else 'unknown'}")
-    if not ask_yes("Do you want to reinstall BIND9 from source? [y/N]"):
+    if not await ask_yes("Do you want to reinstall BIND9 from source? [y/N]"):
         info("Keeping existing BIND9 installation.")
         return
     code, dpkg_out = await run("dpkg", "-l", "bind9", check=False, capture=True)
@@ -521,24 +563,24 @@ async def detect_existing_bind(cfg: Config) -> None:
 async def gather_config(cfg: Config, versions_task: asyncio.Task) -> None:
     header("Configuration")
 
-    cfg.domain = prompt("Domain for DoT/DoH (e.g. dns.example.com)", "")
+    cfg.domain = await prompt("Domain for DoT/DoH (e.g. dns.example.com)", "")
     if not cfg.domain:
         die("Domain is required.")
 
-    cfg.fwd1 = prompt("Upstream forwarder 1", "8.8.8.8")
-    cfg.fwd2 = prompt("Upstream forwarder 2", "1.1.1.1")
+    cfg.fwd1 = await prompt("Upstream forwarder 1", "8.8.8.8")
+    cfg.fwd2 = await prompt("Upstream forwarder 2", "1.1.1.1")
 
-    cfg.use_rpz = ask_yes("Enable RPZ adblock (hagezi/dns-blocklists pro list)? [y/N]")
+    cfg.use_rpz = await ask_yes("Enable RPZ adblock (hagezi/dns-blocklists pro list)? [y/N]")
     if cfg.use_rpz:
-        cfg.rpz_timer = prompt("RPZ timer schedule (systemd OnCalendar)", "*-*-* 04:00:00")
+        cfg.rpz_timer = await prompt("RPZ timer schedule (systemd OnCalendar)", "*-*-* 04:00:00")
 
-    cfg.use_stats = ask_yes("Enable statistics channel on 127.0.0.1:8053? [y/N]")
+    cfg.use_stats = await ask_yes("Enable statistics channel on 127.0.0.1:8053? [y/N]")
 
     print()
     print(f"  {BOLD}Where should BIND9 come from?{NC}")
     print("    1) Distro mirror (apt)          — fast, whatever your release ships")
     print("    2) Build a specific version from ISC source")
-    choice = prompt("Choose 1 or 2", "1")
+    choice = await prompt("Choose 1 or 2", "1")
 
     if cfg.force_source_reinstall:
         cfg.install_mode = "source"
@@ -556,7 +598,7 @@ async def gather_config(cfg: Config, versions_task: asyncio.Task) -> None:
         shown = versions[:15]
         for i, ver in enumerate(shown, start=1):
             print(f"    {i:2d}) {ver}")
-        sel = prompt("Select a version number (or type an exact version)", "1")
+        sel = await prompt("Select a version number (or type an exact version)", "1")
         if sel.isdigit() and 1 <= int(sel) <= len(shown):
             cfg.bind_src_ver = shown[int(sel) - 1]
         elif re.fullmatch(r"9\.\d+\.\d+", sel):
@@ -565,7 +607,7 @@ async def gather_config(cfg: Config, versions_task: asyncio.Task) -> None:
             die(f"Invalid selection: '{sel}'.")
 
         print()
-        if ask_yes("Overwrite the distro BIND binaries in /usr? [y/N]"):
+        if await ask_yes("Overwrite the distro BIND binaries in /usr? [y/N]"):
             cfg.bind_prefix = "/usr"
         else:
             cfg.bind_prefix = "/usr/local"
@@ -580,7 +622,7 @@ async def gather_config(cfg: Config, versions_task: asyncio.Task) -> None:
     print(f"  {BOLD}RPZ:{NC}        {'enabled (' + cfg.rpz_timer + ')' if cfg.use_rpz else 'disabled'}")
     print(f"  {BOLD}Stats:{NC}      {'enabled' if cfg.use_stats else 'disabled'}")
     print()
-    if input("  Proceed? [Y/n]: ").strip().lower().startswith("n"):
+    if (await prompt("Proceed? [Y/n]")).lower().startswith("n"):
         raise SystemExit(0)
 
 
