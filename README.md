@@ -99,6 +99,43 @@ sudo ./bind9-setup.sh
 
 ---
 
+## `bind9_setup.py` — async Python rewrite
+
+`bind9_setup.py` is a faithful, modern rewrite of `bind9-setup.sh` using
+`asyncio`. It performs the exact same steps — package installs, optional source
+build, certbot issuance, `named.conf.*` generation, RPZ timer, firewall, smoke
+test — but runs subprocesses and downloads on the event loop, overlapping the
+ISC version fetch with the interactive prompts and the tarball/checksum
+downloads with each other.
+
+```bash
+sudo ./bind9_setup.py        # same prompts and behaviour as the bash script
+```
+
+### Testing — `run_tests.py`
+
+`run_tests.py` orchestrates three stages with a dynamic, in-place CLI:
+
+1. **Ruff** lint over the sources.
+2. **Unit tests** in `tests/` (pure renderers, version parsing, async helpers).
+3. **Live Podman integration** — spins up `debian:trixie-slim` and drives the
+   real install routines for **both** methods (apt mirror and ISC source
+   build), asserting `named` ends up installed and executable.
+
+On a free-threaded (no-GIL) interpreter the stages run concurrently across CPU
+cores via `threading`; otherwise they fall back to sequential execution. The
+runner animates a spinner per running stage and prints a summary box with
+totals, dumping failure logs and aborting non-zero if any stage fails.
+
+```bash
+uv venv --python python3.14t .venv
+uv pip install --python .venv/bin/python ruff pytest
+.venv/bin/python run_tests.py              # all stages
+.venv/bin/python run_tests.py --no-podman  # skip the container stages
+```
+
+---
+
 ## Requirements & notes
 
 - Run as **root** on Debian/Ubuntu.
