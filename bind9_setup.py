@@ -1,1768 +1,1018 @@
 #!/usr/bin/env python3
-"""bind9_setup.py — Set up BIND9 with DoT/DoH and optional RPZ adblocking on Debian/Ubuntu.
+"""BIND9 Setup — DNS / DoT / DoH + optional RPZ adblock.
 
-Complete Python 3.10+ rewrite of bind9-setup.sh.
-Requires root privileges to run.
+Async rewrite of bind9-setup.sh. Supports Debian 11/12, Ubuntu 20.04/22.04/24.04.
+Requires root, an open port 80 (certbot) and a domain pointed at this server.
 """
-
 from __future__ import annotations
 
-import argparse
-import grp
-import hashlib
-import logging
+import asyncio
 import os
-import pwd
 import re
 import shutil
-import subprocess
 import sys
-import tarfile
 import tempfile
-import textwrap
 import time
+import urllib.request
 from dataclasses import dataclass, field
-from io import BytesIO
-from pathlib import Path
-from typing import Any
-from urllib.error import URLError
-from urllib.request import Request, urlopen
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
+# ── Colours ──────────────────────────────────────────────────────────────────
+RED = "\033[0;31m"
+GREEN = "\033[0;32m"
+YELLOW = "\033[1;33m"
+CYAN = "\033[0;36m"
+BOLD = "\033[1m"
+NC = "\033[0m"
 
-BIND_VERSION_FALLBACK: list[str] = ["9.20.7", "9.18.33"]
-ISC_DOWNLOAD_BASE = "https://downloads.isc.org/isc/bind9"
-ISC_VERSION_INDEX = f"{ISC_DOWNLOAD_BASE}/"
+# Fallback version list used when the ISC mirror cannot be reached.
+BIND_VERSION_FALLBACK = ["9.20.7", "9.18.33"]
 
-DEFAULT_FWD1 = "1.1.1.1"
-DEFAULT_FWD2 = "8.8.8.8"
-DEFAULT_RPZ_TIMER = "6h"
-DEFAULT_BIND_PREFIX = "/usr"
+# Highest minor release allowed: 9.21+ is a development-only branch.
+BIND_MAX_MINOR = 20
 
-REQUIRED_APT_PACKAGES = [
-    "bind9",
-    "bind9utils",
-    "dnsutils",
-    "certbot",
-    "curl",
-    "util-linux",
+ISC_BASE = "https://downloads.isc.org/isc/bind9"
+
+# Binaries cleaned up before a meson install to avoid file conflicts.
+BIND_BINARIES = [
+    "named", "named-checkconf", "named-checkzone", "named-compilezone",
+    "named-journalprint", "named-nzd2nzf", "named-rrchecker", "rndc",
+    "rndc-confgen", "tsig-keygen", "ddns-confgen", "delv", "dig", "host",
+    "nslookup", "nsupdate", "dnssec-cds", "dnssec-dsfromkey",
+    "dnssec-importkey", "dnssec-keyfromlabel", "dnssec-keygen",
+    "dnssec-revoke", "dnssec-settime", "dnssec-signzone", "dnssec-verify",
+    "mdig", "arpaname", "dnstap-read", "nsec3hash",
 ]
 
-SOURCE_BUILD_DEPS = [
-    "build-essential",
-    "pkg-config",
-    "xz-utils",
-    "perl",
-    "python3",
-    "meson",
-    "ninja-build",
-    "libssl-dev",
-    "libuv1-dev",
-    "libcap-dev",
-    "libnghttp2-dev",
-    "liburcu-dev",
-    "libjemalloc-dev",
-    "liblmdb-dev",
-    "libxml2-dev",
-    "libjson-c-dev",
-    "libmaxminddb-dev",
-    "dnsutils",
-    "certbot",
-    "curl",
-    "util-linux",
-]
 
-CONFLICTING_WEB_SERVICES = ["nginx", "apache2", "lighttpd", "caddy"]
-
-RPZ_BLOCKLISTS = [
-    "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
-    "https://adaway.org/hosts.txt",
-]
-
-LOG = logging.getLogger("bind9_setup")
+def info(msg: str) -> None:
+    print(f"{CYAN}[INFO]{NC}  {msg}")
 
 
-# ---------------------------------------------------------------------------
-# Exceptions
-# ---------------------------------------------------------------------------
+def ok(msg: str) -> None:
+    print(f"{GREEN}[ OK ]{NC}  {msg}")
 
 
-class SetupError(Exception):
-    """Raised when a setup step fails irrecoverably."""
+def warn(msg: str) -> None:
+    print(f"{YELLOW}[WARN]{NC}  {msg}")
 
 
-# ---------------------------------------------------------------------------
-# Colored logging
-# ---------------------------------------------------------------------------
+def die(msg: str) -> None:
+    print(f"{RED}[ERR ]{NC}  {msg}", file=sys.stderr)
+    raise SystemExit(1)
 
 
-class ColoredFormatter(logging.Formatter):
-    """Logging formatter that adds ANSI colours to level names."""
-
-    COLORS = {
-        logging.DEBUG: "\033[2;37m",      # dim grey
-        logging.INFO: "\033[0;36m",       # cyan
-        logging.WARNING: "\033[0;33m",    # yellow
-        logging.ERROR: "\033[0;31m",      # red
-        logging.CRITICAL: "\033[1;31m",   # bold red
-    }
-    RESET = "\033[0m"
-
-    def __init__(self, fmt: str | None = None, datefmt: str | None = None) -> None:
-        super().__init__(fmt=fmt, datefmt=datefmt)
-
-    def format(self, record: logging.LogRecord) -> str:
-        color = self.COLORS.get(record.levelno, self.RESET)
-        record.levelname = f"{color}{record.levelname}{self.RESET}"
-        return super().format(record)
-
-
-def setup_logging(debug: bool = False) -> None:
-    """Configure the root logger with coloured console output."""
-    level = logging.DEBUG if debug else logging.INFO
-    handler = logging.StreamHandler(sys.stderr)
-    handler.setFormatter(
-        ColoredFormatter(fmt="%(levelname)s %(message)s")
+def header(msg: str) -> None:
+    print(
+        f"\n{BOLD}══════════════════════════════════════\n"
+        f"  {msg}\n"
+        f"══════════════════════════════════════{NC}"
     )
-    LOG.setLevel(level)
-    LOG.addHandler(handler)
 
 
-# ---------------------------------------------------------------------------
-# Configuration dataclass
-# ---------------------------------------------------------------------------
+# ── Async process / network helpers ──────────────────────────────────────────
+class CommandError(RuntimeError):
+    def __init__(self, cmd: list[str], code: int, output: str):
+        super().__init__(f"command failed ({code}): {' '.join(cmd)}\n{output}")
+        self.cmd = cmd
+        self.code = code
+        self.output = output
 
 
-@dataclass
-class Config:
-    """Holds every user-supplied and derived setting."""
-
-    domain: str = ""
-    fwd1: str = DEFAULT_FWD1
-    fwd2: str = DEFAULT_FWD2
-    use_rpz: bool = True
-    rpz_timer: str = DEFAULT_RPZ_TIMER
-    use_stats: bool = False
-    install_mode: str = "apt"          # "apt" | "source"
-    bind_version: str = ""
-    bind_prefix: str = DEFAULT_BIND_PREFIX
-    doh_enabled: bool = False
-    bind_user: str = "bind"
-    bind_dir: Path = field(default_factory=lambda: Path("/etc/bind"))
-    bind_ssl_dir: Path = field(default_factory=lambda: Path("/etc/bind/ssl"))
-    skip_certbot: bool = False
-    skip_firewall: bool = False
-    non_interactive: bool = False
-
-    # Resolved at runtime
-    rndc_bin: str = ""
-    named_compilezone_bin: str = ""
-    named_checkconf_bin: str = ""
-
-
-# ---------------------------------------------------------------------------
-# Utility helpers
-# ---------------------------------------------------------------------------
-
-
-def run_cmd(
-    cmd: list[str],
+async def run(
+    *cmd: str,
     check: bool = True,
     capture: bool = False,
-    **kwargs: Any,
-) -> subprocess.CompletedProcess[str]:
-    """Run a command via subprocess, logging the invocation."""
-    LOG.debug("exec: %s", " ".join(cmd))
-    stdout = subprocess.PIPE if capture else None
-    stderr = subprocess.PIPE if capture else None
-    result = subprocess.run(
-        cmd,
-        text=True,
-        stdout=stdout,
-        stderr=stderr,
-        **kwargs,
+    env: dict[str, str] | None = None,
+    cwd: str | None = None,
+) -> tuple[int, str]:
+    """Run a subprocess asynchronously. Returns (returncode, combined output)."""
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE if capture else None,
+        stderr=asyncio.subprocess.STDOUT if capture else None,
+        env=env,
+        cwd=cwd,
     )
-    if check and result.returncode != 0:
-        detail = ""
-        if result.stderr:
-            detail = f"\n  stderr: {result.stderr.strip()}"
-        raise SetupError(
-            f"Command failed (rc={result.returncode}): {' '.join(cmd)}{detail}"
-        )
-    return result
+    out_b, _ = await proc.communicate()
+    out = out_b.decode(errors="replace") if out_b else ""
+    code = proc.returncode or 0
+    if check and code != 0:
+        raise CommandError(list(cmd), code, out)
+    return code, out
 
 
-def resolve_binary(name: str, prefix: str = "/usr") -> str:
-    """Locate a binary using shutil.which with fallback paths."""
-    found = shutil.which(name)
-    if found:
-        return found
-    # Try common prefix-relative paths
-    for subdir in ("sbin", "bin", "local/sbin", "local/bin"):
-        candidate = Path(prefix) / subdir / name
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            return str(candidate)
-    # Last-resort search
-    for search in ("/usr/sbin", "/usr/bin", "/usr/local/sbin", "/usr/local/bin"):
-        candidate = Path(search) / name
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            return str(candidate)
-    LOG.warning("Binary '%s' not found in PATH or prefix '%s'", name, prefix)
-    return name  # return bare name, let the caller fail with a clear message
-
-
-def detect_bind_user() -> str:
-    """Return the BIND runtime user name."""
-    for candidate in ("named", "bind"):
-        try:
-            pwd.getpwnam(candidate)
-            LOG.debug("Detected BIND user: %s", candidate)
-            return candidate
-        except KeyError:
-            continue
-    LOG.warning("Could not detect BIND user; defaulting to 'bind'")
-    return "bind"
-
-
-def _uid_gid(user: str, group: str | None = None) -> tuple[int, int]:
-    """Resolve numeric uid/gid for user and optional group."""
-    pw = pwd.getpwnam(user)
-    uid = pw.pw_uid
-    if group:
-        gid = grp.getgrnam(group).gr_gid
-    else:
-        gid = pw.pw_gid
-    return uid, gid
-
-
-def atomic_write(
-    path: Path,
-    content: str,
-    mode: int = 0o644,
-    owner: str | None = None,
-    group: str | None = None,
-) -> None:
-    """Write *content* to *path* atomically via tempfile + os.replace."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.")
+async def run_ok(*cmd: str, **kw: object) -> bool:
+    """Run a command, swallowing failures. Returns success boolean."""
     try:
-        os.write(fd, content.encode())
-        os.fchmod(fd, mode)
-        if owner:
-            uid, gid = _uid_gid(owner, group)
-            os.fchown(fd, uid, gid)
-        os.close(fd)
-        os.replace(tmp, str(path))
-        LOG.debug("Wrote %s (%d bytes)", path, len(content))
-    except BaseException:
-        os.close(fd) if not os.get_inheritable(fd) else None  # noqa: E501
-        Path(tmp).unlink(missing_ok=True)
-        raise
+        code, _ = await run(*cmd, check=False, **kw)  # type: ignore[arg-type]
+        return code == 0
+    except FileNotFoundError:
+        return False
 
 
-def backup_config(path: Path) -> None:
-    """If *path* exists, copy it to path.bak.<timestamp>."""
-    if not path.exists():
-        return
-    ts = time.strftime("%Y%m%d%H%M%S")
-    bak = path.with_suffix(f"{path.suffix}.bak.{ts}")
-    shutil.copy2(path, bak)
-    LOG.info("Backed up %s → %s", path, bak)
+async def http_get_text(url: str, timeout: int = 30) -> str:
+    """Fetch a URL body as text without blocking the event loop."""
+    def _get() -> str:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            return resp.read().decode(errors="replace")
+
+    return await asyncio.to_thread(_get)
 
 
-# ---------------------------------------------------------------------------
-# Version helpers
-# ---------------------------------------------------------------------------
+async def curl_download(url: str, dest: str, *, max_time: int = 300) -> bool:
+    """Download a file with curl, mirroring the retry policy of the bash script."""
+    return await run_ok(
+        "curl", "-sS", "-f", "--connect-timeout", "10",
+        "--max-time", str(max_time), "--retry", "3",
+        "--retry-all-errors", "--retry-delay", "5",
+        "-o", dest, url,
+    )
 
 
-def _version_key(v: str) -> tuple[int, ...]:
-    """Return a sortable tuple of ints for a version string like '9.20.7'."""
-    return tuple(int(x) for x in v.split("."))
+# ── Version discovery ────────────────────────────────────────────────────────
+def parse_bind_versions(html: str, max_minor: int = BIND_MAX_MINOR) -> list[str]:
+    """Extract stable x.y.z versions from the ISC index, newest first.
 
-
-def fetch_bind_versions() -> list[str]:
-    """Fetch available BIND 9 versions from ISC downloads page.
-
-    Returns a deduplicated list of version strings, newest first.
-    Falls back to BIND_VERSION_FALLBACK on network errors.
+    Drops rc/beta/alpha pre-releases and development branches above max_minor.
     """
-    LOG.info("Fetching available BIND versions from ISC …")
+    found = re.findall(r"9\.\d+\.\d+(?=/)", html)
+    keep = [v for v in set(found) if int(v.split(".")[1]) <= max_minor]
+    keep.sort(key=lambda v: tuple(int(p) for p in v.split(".")), reverse=True)
+    return keep
+
+
+async def fetch_bind_versions() -> tuple[list[str], bool]:
+    """Return (versions, online). Falls back to a built-in list when offline."""
     try:
-        req = Request(ISC_VERSION_INDEX, headers={"User-Agent": "bind9_setup/1.0"})
-        with urlopen(req, timeout=15) as resp:
-            page = resp.read().decode("utf-8", errors="replace")
-        matches = re.findall(r"9\.\d+\.\d+(?=/)", page)
-        if not matches:
-            LOG.warning("No versions parsed from ISC page; using fallback list")
-            return list(BIND_VERSION_FALLBACK)
-        seen: set[str] = set()
-        unique: list[str] = []
-        for v in matches:
-            if v not in seen:
-                seen.add(v)
-                unique.append(v)
-        unique.sort(key=_version_key, reverse=True)
-        LOG.debug("Found %d BIND versions", len(unique))
-        return unique
-    except (URLError, OSError, ValueError) as exc:
-        LOG.warning("Cannot fetch versions (%s); using fallback list", exc)
-        return list(BIND_VERSION_FALLBACK)
+        html = await http_get_text(f"{ISC_BASE}/", timeout=30)
+        versions = parse_bind_versions(html)
+        if versions:
+            return versions, True
+    except Exception:
+        pass
+    return list(BIND_VERSION_FALLBACK), False
 
 
-def parse_bind_version(version_string: str) -> tuple[int, int]:
-    """Extract (major, minor) from ``named -v`` output.
-
-    >>> parse_bind_version("BIND 9.20.7-1ubuntu1 (Stable Release)")
-    (9, 20)
-    """
-    m = re.search(r"BIND\s+(\d+)\.(\d+)", version_string)
+def parse_named_version(named_output: str) -> tuple[int, int] | None:
+    """Parse 'BIND 9.18.33-...' output into a (major, minor) tuple."""
+    m = re.search(r"BIND (\d+)\.(\d+)", named_output)
     if not m:
-        raise SetupError(f"Cannot parse BIND version from: {version_string!r}")
+        return None
     return int(m.group(1)), int(m.group(2))
 
 
-def compare_versions(v1: str, v2: str) -> int:
-    """Compare two dotted version strings.
-
-    Returns -1 if v1 < v2, 0 if equal, 1 if v1 > v2.
-    """
-    k1, k2 = _version_key(v1), _version_key(v2)
-    if k1 < k2:
-        return -1
-    if k1 > k2:
-        return 1
-    return 0
-
-
-def detect_existing_bind(config: Config) -> tuple[bool, str]:
-    """Check if BIND9 is already installed.
-
-    Returns (is_installed, version_string).
-    """
-    named_bin = shutil.which("named")
-    if not named_bin:
-        return False, ""
-    result = run_cmd([named_bin, "-v"], capture=True, check=False)
-    if result.returncode != 0:
-        return False, ""
-    version_str = result.stdout.strip()
-    LOG.info("Existing BIND9 detected: %s", version_str)
-    return True, version_str
-
-
-def is_bind_from_apt() -> bool:
-    """Check if the currently installed BIND9 came from apt."""
-    result = run_cmd(
-        ["dpkg", "-l", "bind9"],
-        capture=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        return False
-    return bool(re.search(r"^ii\s+bind9\s", result.stdout, re.MULTILINE))
-
-
-def remove_apt_bind() -> None:
-    """Remove BIND9 packages installed via apt."""
-    LOG.info("Removing apt-installed BIND9 packages …")
-    # Stop the service first
-    run_cmd(["systemctl", "stop", "named"], check=False)
-    run_cmd(["systemctl", "stop", "bind9"], check=False)
-    env = {**os.environ, "DEBIAN_FRONTEND": "noninteractive"}
-    run_cmd(
-        ["apt-get", "remove", "--purge", "-y", "bind9", "bind9utils", "bind9-utils"],
-        env=env,
-        check=False,
-    )
-    run_cmd(["apt-get", "autoremove", "-y"], env=env, check=False)
-    LOG.info("Apt-installed BIND9 packages removed ✓")
-
-
-def handle_existing_bind(config: Config) -> None:
-    """If BIND9 is already installed, ask the user whether to reinstall from source.
-
-    When the user opts to reinstall:
-    - If the existing install is from apt, purge the apt packages first.
-    - If the existing install is from source (not apt), the new source build
-      will simply override the systemd unit (the scripts already support this).
-    - Forces config.install_mode to 'source'.
-    """
-    is_installed, version_str = detect_existing_bind(config)
-    if not is_installed:
-        return
-
-    LOG.warning("Existing BIND9 installation found: %s", version_str)
-
-    if config.non_interactive:
-        LOG.info("Non-interactive mode — keeping existing BIND9 installation")
-        return
-
-    reinstall = _prompt_yes_no(
-        f"BIND9 is already installed ({version_str}). "
-        "Do you want to reinstall from source?",
-        default=False,
-    )
-    if not reinstall:
-        LOG.info("Keeping existing BIND9 installation")
-        return
-
-    # Check if installed via apt and remove if so
-    if is_bind_from_apt():
-        LOG.info("Existing BIND9 was installed via apt")
-        remove_apt_bind()
-    else:
-        LOG.info(
-            "Existing BIND9 is not from apt (likely a previous source build). "
-            "The new source build will override it via the systemd unit."
-        )
-
-    # Force source mode for the rest of the setup
-    config.install_mode = "source"
-    LOG.info("Install mode forced to 'source' for reinstall")
-
-
-# ---------------------------------------------------------------------------
-# Package installation
-# ---------------------------------------------------------------------------
-
-
-def install_packages(packages: list[str]) -> None:
-    """Install Debian/Ubuntu packages via apt-get."""
-    LOG.info("Installing packages: %s", " ".join(packages))
-    env = {**os.environ, "DEBIAN_FRONTEND": "noninteractive"}
-    run_cmd(["apt-get", "update", "-qq"], env=env)
-    run_cmd(
-        ["apt-get", "install", "-y", "-qq", "--no-install-recommends"] + packages,
-        env=env,
-    )
-    LOG.info("Package installation complete")
-
-
-# ---------------------------------------------------------------------------
-# Source build
-# ---------------------------------------------------------------------------
-
-
-def _download_with_progress(url: str, description: str) -> bytes:
-    """Download URL content into memory, logging progress."""
-    LOG.info("Downloading %s …", description)
-    req = Request(url, headers={"User-Agent": "bind9_setup/1.0"})
-    with urlopen(req, timeout=120) as resp:
-        data = resp.read()
-    LOG.info("Downloaded %s (%d bytes)", description, len(data))
-    return data
-
-
-def build_bind_from_source(version: str, prefix: str) -> None:
-    """Download, verify, build and install BIND from source."""
-    tarball_name = f"bind-{version}.tar.xz"
-    tarball_url = f"{ISC_DOWNLOAD_BASE}/{version}/{tarball_name}"
-    sha512_url = f"{tarball_url}.sha512"
-
-    # Download tarball
-    tarball_data = _download_with_progress(tarball_url, tarball_name)
-
-    # Download and verify SHA-512
-    try:
-        sha_data = _download_with_progress(sha512_url, f"{tarball_name}.sha512")
-        expected_hash = sha_data.decode().strip().split()[0].lower()
-        actual_hash = hashlib.sha512(tarball_data).hexdigest().lower()
-        if actual_hash != expected_hash:
-            raise SetupError(
-                f"SHA-512 mismatch for {tarball_name}:\n"
-                f"  expected: {expected_hash}\n"
-                f"  actual:   {actual_hash}"
-            )
-        LOG.info("SHA-512 checksum verified ✓")
-    except (URLError, OSError) as exc:
-        LOG.warning("Could not verify SHA-512 checksum: %s — continuing anyway", exc)
-
-    # Extract
-    build_dir = Path("/usr/local/src/bind9-build")
-    if build_dir.exists():
-        shutil.rmtree(build_dir)
-    build_dir.mkdir(parents=True)
-
-    LOG.info("Extracting %s …", tarball_name)
-    with tarfile.open(fileobj=BytesIO(tarball_data), mode="r:xz") as tf:
-        tf.extractall(path=str(build_dir))
-
-    # Find the extracted directory
-    subdirs = [d for d in build_dir.iterdir() if d.is_dir()]
-    if not subdirs:
-        raise SetupError("Tarball extraction produced no directory")
-    src_dir = subdirs[0]
-    LOG.info("Source directory: %s", src_dir)
-
-    # Detect build system: BIND 9.21+ uses meson, older versions use autotools
-    uses_meson = (src_dir / "meson.build").is_file()
-    uses_autotools = (src_dir / "configure").is_file()
-
-    if uses_meson:
-        LOG.info("Detected meson build system (BIND 9.21+)")
-
-        # Configure via meson setup
-        meson_args = [
-            "meson", "setup", str(src_dir / "builddir"), str(src_dir),
-            f"--prefix={prefix}",
-            "--sysconfdir=/etc/bind",
-            "--localstatedir=/var",
-        ]
-        LOG.info("Configuring BIND %s (meson, prefix=%s) …", version, prefix)
-        run_cmd(meson_args)
-
-        # Build via ninja
-        ncpu = os.cpu_count() or 2
-        LOG.info("Building BIND %s (using %d parallel jobs) …", version, ncpu)
-        run_cmd(["ninja", "-C", str(src_dir / "builddir"), f"-j{ncpu}"])
-
-        # Cleanup old binaries to prevent meson install symlink conflicts
-        LOG.info("Cleaning up old BIND binaries to prevent meson install conflicts …")
-        bind_bins = [
-            "named", "named-checkconf", "named-checkzone", "named-compilezone", "named-journalprint",
-            "named-nzd2nzf", "named-rrchecker", "rndc", "rndc-confgen", "tsig-keygen", "ddns-confgen",
-            "delv", "dig", "host", "nslookup", "nsupdate", "dnssec-cds", "dnssec-dsfromkey",
-            "dnssec-importkey", "dnssec-keyfromlabel", "dnssec-keygen", "dnssec-revoke",
-            "dnssec-settime", "dnssec-signzone", "dnssec-verify", "mdig", "arpaname",
-            "dnstap-read", "nsec3hash"
-        ]
-        for b in bind_bins:
-            for p in (f"{prefix}/bin/{b}", f"{prefix}/sbin/{b}", f"/usr/bin/{b}", f"/usr/sbin/{b}"):
-                try:
-                    Path(p).unlink(missing_ok=True)
-                except OSError:
-                    pass
-
-        # Install
-        LOG.info("Installing BIND %s to %s …", version, prefix)
-        run_cmd(["meson", "install", "-C", str(src_dir / "builddir")])
-
-    elif uses_autotools:
-        LOG.info("Detected autotools build system (BIND ≤9.20)")
-
-        # Configure
-        LOG.info("Configuring BIND %s (prefix=%s) …", version, prefix)
-        configure_args = [
-            str(src_dir / "configure"),
-            f"--prefix={prefix}",
-            "--sysconfdir=/etc/bind",
-            "--localstatedir=/var",
-            "--with-libnghttp2",
-            "--enable-doh",
-            "--with-openssl",
-            "--disable-linux-caps",
-        ]
-        run_cmd(configure_args, cwd=str(src_dir))
-
-        # Build
-        ncpu = os.cpu_count() or 2
-        LOG.info("Building BIND %s (using %d parallel jobs) …", version, ncpu)
-        run_cmd(["make", f"-j{ncpu}"], cwd=str(src_dir))
-
-        # Install
-        LOG.info("Installing BIND %s to %s …", version, prefix)
-        run_cmd(["make", "install"], cwd=str(src_dir))
-
-    else:
-        raise SetupError(
-            f"Cannot determine build system: neither meson.build nor configure "
-            f"found in {src_dir}"
-        )
-
-    run_cmd(["ldconfig"])
-
-    # Create systemd override if prefix != /usr
-    if prefix != "/usr":
-        override_dir = Path("/etc/systemd/system/named.service.d")
-        override_dir.mkdir(parents=True, exist_ok=True)
-        override_content = generate_named_override(prefix)
-        atomic_write(override_dir / "override.conf", override_content)
-        run_cmd(["systemctl", "daemon-reload"])
-        LOG.info("Created systemd override for prefix %s", prefix)
-
-    LOG.info("BIND %s built and installed successfully ✓", version)
-
-
-# ---------------------------------------------------------------------------
-# BIND version check
-# ---------------------------------------------------------------------------
-
-
-def check_bind_version(config: Config) -> None:
-    """Check installed BIND version and set config.doh_enabled accordingly."""
-    named_bin = resolve_binary("named", config.bind_prefix)
-    result = run_cmd([named_bin, "-v"], capture=True, check=False)
-    if result.returncode != 0:
-        LOG.warning("Could not run 'named -v'; assuming DoH is unavailable")
-        config.doh_enabled = False
-        return
-
-    version_output = result.stdout.strip()
-    LOG.info("Installed BIND: %s", version_output)
-    major, minor = parse_bind_version(version_output)
-
-    if major >= 9 and minor >= 18:
-        LOG.info("BIND %d.%d supports DNS-over-HTTPS ✓", major, minor)
-        config.doh_enabled = True
-    else:
-        LOG.warning(
-            "BIND %d.%d does not support DoH (requires 9.18+). "
-            "DNS-over-TLS only.",
-            major,
-            minor,
-        )
-        config.doh_enabled = False
-
-        # Try backports for apt mode
-        if config.install_mode == "apt":
-            LOG.info("Attempting to install newer BIND from backports …")
-            try:
-                # Detect distro codename
-                result2 = run_cmd(
-                    ["lsb_release", "-cs"], capture=True, check=False
-                )
-                codename = result2.stdout.strip() if result2.returncode == 0 else ""
-                if codename:
-                    backport_src = f"deb http://deb.debian.org/debian {codename}-backports main"
-                    sources_list = Path("/etc/apt/sources.list.d/backports.list")
-                    if not sources_list.exists():
-                        atomic_write(sources_list, backport_src + "\n")
-                    env = {**os.environ, "DEBIAN_FRONTEND": "noninteractive"}
-                    run_cmd(["apt-get", "update", "-qq"], env=env)
-                    run_cmd(
-                        [
-                            "apt-get",
-                            "install",
-                            "-y",
-                            "-qq",
-                            f"-t{codename}-backports",
-                            "bind9",
-                            "bind9utils",
-                        ],
-                        env=env,
-                    )
-                    # Re-check
-                    result3 = run_cmd([named_bin, "-v"], capture=True, check=False)
-                    if result3.returncode == 0:
-                        maj2, min2 = parse_bind_version(result3.stdout.strip())
-                        if maj2 >= 9 and min2 >= 18:
-                            config.doh_enabled = True
-                            LOG.info("Backports BIND %d.%d supports DoH ✓", maj2, min2)
-            except SetupError as exc:
-                LOG.warning("Backports attempt failed: %s", exc)
-
-
-# ---------------------------------------------------------------------------
-# Certificate management
-# ---------------------------------------------------------------------------
-
-
-def obtain_certificate(domain: str) -> None:
-    """Obtain a TLS certificate via certbot standalone."""
-    LOG.info("Obtaining TLS certificate for %s via certbot …", domain)
-
-    # Stop conflicting web servers
-    stopped_services: list[str] = []
-    for svc in CONFLICTING_WEB_SERVICES:
-        result = run_cmd(
-            ["systemctl", "is-active", "--quiet", svc], check=False
-        )
-        if result.returncode == 0:
-            LOG.info("Temporarily stopping %s …", svc)
-            run_cmd(["systemctl", "stop", svc])
-            stopped_services.append(svc)
-
-    try:
-        run_cmd(
-            [
-                "certbot",
-                "certonly",
-                "--standalone",
-                "--non-interactive",
-                "--agree-tos",
-                "--register-unsafely-without-email",
-                "-d",
-                domain,
-            ]
-        )
-        LOG.info("Certificate obtained ✓")
-    finally:
-        # Restart stopped services
-        for svc in stopped_services:
-            LOG.info("Restarting %s …", svc)
-            run_cmd(["systemctl", "start", svc], check=False)
-
-
-def install_certificates(config: Config) -> None:
-    """Copy Let's Encrypt certificates to BIND ssl directory."""
-    le_dir = Path(f"/etc/letsencrypt/live/{config.domain}")
-    if not le_dir.is_dir():
-        raise SetupError(
-            f"Certificate directory not found: {le_dir}\n"
-            "Run certbot first or use --skip-certbot."
-        )
-
-    ssl_dir = config.bind_ssl_dir
-    ssl_dir.mkdir(parents=True, exist_ok=True)
-
-    cert_src = le_dir / "fullchain.pem"
-    key_src = le_dir / "privkey.pem"
-
-    cert_dst = ssl_dir / "cert.pem"
-    key_dst = ssl_dir / "key.pem"
-
-    LOG.info("Copying certificates to %s …", ssl_dir)
-    shutil.copy2(cert_src, cert_dst)
-    shutil.copy2(key_src, key_dst)
-
-    uid, gid = _uid_gid(config.bind_user)
-    os.chown(ssl_dir, uid, gid)
-    os.chown(cert_dst, uid, gid)
-    os.chown(key_dst, uid, gid)
-    os.chmod(cert_dst, 0o640)
-    os.chmod(key_dst, 0o640)
-    os.chmod(ssl_dir, 0o750)
-
-    LOG.info("Certificates installed ✓")
-
-    # Deploy hook for automatic renewal
-    hook_dir = Path("/etc/letsencrypt/renewal-hooks/deploy")
-    hook_dir.mkdir(parents=True, exist_ok=True)
-    hook_path = hook_dir / "bind-cert-deploy.sh"
-    hook_content = generate_certbot_hook(config.rndc_bin)
-    atomic_write(hook_path, hook_content, mode=0o755)
-    LOG.info("Certbot renewal deploy hook installed at %s", hook_path)
-
-
-# ---------------------------------------------------------------------------
-# Config file generators (pure functions)
-# ---------------------------------------------------------------------------
-
-
-def generate_named_conf_options(config: Config) -> str:
-    """Return the full named.conf.options content."""
+def doh_supported(major: int, minor: int) -> bool:
+    """DoH (port 443) requires BIND 9.18+."""
+    return major > 9 or (major == 9 and minor >= 18)
+
+
+# ── Configuration model ──────────────────────────────────────────────────────
+@dataclass
+class Config:
+    domain: str = ""
+    fwd1: str = "8.8.8.8"
+    fwd2: str = "1.1.1.1"
+    use_rpz: bool = False
+    rpz_timer: str = "*-*-* 04:00:00"
+    use_stats: bool = False
+    install_mode: str = "distro"  # "distro" | "source"
+    bind_src_ver: str = ""
+    bind_prefix: str = "/usr"
+    force_source_reinstall: bool = False
+    # Runtime-resolved values
+    bind_user: str = "bind"
+    doh_enabled: bool = False
+    bind_dir: str = "/etc/bind"
+    named_compilezone: str = "/usr/sbin/named-compilezone"
+    rndc: str = "/usr/sbin/rndc"
+    extra_path: list[str] = field(default_factory=list)
+
+    @property
+    def bind_ssl(self) -> str:
+        return f"{self.bind_dir}/ssl"
+
+
+# ── Config-file renderers (pure, unit-testable) ──────────────────────────────
+def render_named_conf_options(cfg: Config) -> str:
     rpz_block = ""
-    if config.use_rpz:
-        rpz_block = textwrap.dedent("""\
-
-            response-policy {
-                zone "rpz.local" policy given;
-            };
-        """)
+    if cfg.use_rpz:
+        rpz_block = (
+            "\n    response-policy {\n"
+            '        zone "rpz.adblock";\n'
+            "    };\n"
+        )
 
     stats_block = ""
-    if config.use_stats:
-        stats_block = textwrap.dedent("""\
+    if cfg.use_stats:
+        stats_block = (
+            "\nstatistics-channels {\n"
+            "    inet 127.0.0.1 port 8053 allow { 127.0.0.1; };\n"
+            "};\n"
+        )
 
-            statistics-channels {
-                inet 127.0.0.1 port 8053 allow { 127.0.0.1; };
-            };
-        """)
+    doh_listen = ""
+    if cfg.doh_enabled:
+        doh_listen = (
+            "\n    listen-on port 443\n"
+            "        tls local-tls\n"
+            "        http local-http-server { any; };"
+        )
 
-    doh_listeners = ""
-    if config.doh_enabled:
-        doh_listeners = textwrap.dedent("""\
+    return f"""options {{
+    directory              "/var/cache/bind";
+    managed-keys-directory "/var/lib/bind";
 
-            // DNS-over-HTTPS (DoH) listener
-            listen-on port 443 tls local-tls http local-http { any; };
-            listen-on-v6 port 443 tls local-tls http local-http { any; };
-        """)
+    // ── Recursion ────────────────────────────────────────────────────────
+    recursion       yes;
+    allow-recursion {{ any; }};   // restrict to your subnets in production
+    allow-query     {{ any; }};
 
-    tls_block = ""
-    if config.domain:
-        tls_block = textwrap.dedent(f"""\
+    // ── Forwarding ───────────────────────────────────────────────────────
+    forward  only;
+    forwarders {{
+        {cfg.fwd1};
+        {cfg.fwd2};
+    }};
 
-        tls local-tls {{
-            cert-file "{config.bind_ssl_dir}/cert.pem";
-            key-file "{config.bind_ssl_dir}/key.pem";
-        }};
-        """)
+    // ── Rate limiting ────────────────────────────────────────────────────
+    rate-limit {{
+        responses-per-second 20;
+        errors-per-second     5;
+        all-per-second       50;
+        log-only             no;
+        window               15;
+    }};
 
-    http_block = ""
-    if config.doh_enabled:
-        http_block = textwrap.dedent("""\
+    max-recursion-depth   20;
+    max-recursion-queries 100;
 
-        http local-http {
-            endpoints { "/dns-query"; };
-        };
-        """)
+    // ── DNSSEC ───────────────────────────────────────────────────────────
+    dnssec-validation auto;
 
-    content = textwrap.dedent(f"""\
-        // Generated by bind9_setup.py — do not edit manually
-        // {time.strftime("%Y-%m-%d %H:%M:%S")}
+    // ── Misc hardening ───────────────────────────────────────────────────
+    minimal-any yes;
+    version  "none";
+    hostname "none";
+    server-id "none";
+{rpz_block}
+    // ── Cache ────────────────────────────────────────────────────────────
+    max-cache-size 200m;
+    max-cache-ttl  86400;
+    min-cache-ttl  60;
 
-        acl trusted {{
-            localhost;
-            localnets;
-        }};
-        {tls_block}{http_block}
-        options {{
-            directory "/var/cache/bind";
-            recursion yes;
-            allow-recursion {{ trusted; }};
-            allow-query {{ any; }};
-            dnssec-validation auto;
+    // ── Listeners ────────────────────────────────────────────────────────
+    listen-on      port 53  {{ any; }};
+    listen-on-v6   port 53  {{ any; }};
 
-            forwarders {{
-                {config.fwd1};
-                {config.fwd2};
-            }};
-            forward only;
+    listen-on port 853
+        tls local-tls
+        {{ any; }};
+    listen-on-v6 port 853
+        tls local-tls
+        {{ any; }};{doh_listen}
+}};
 
-            // DNS-over-TLS (DoT) listener
-            listen-on port 853 tls local-tls {{ any; }};
-            listen-on-v6 port 853 tls local-tls {{ any; }};
+tls local-tls {{
+    cert-file "{cfg.bind_ssl}/fullchain.pem";
+    key-file  "{cfg.bind_ssl}/privkey.pem";
+}};
 
-            // Standard DNS
-            listen-on port 53 {{ any; }};
-            listen-on-v6 port 53 {{ any; }};
-        {doh_listeners}{rpz_block}{stats_block}
-        }};
-    """)
-    return content
-
-
-def generate_named_conf_logging() -> str:
-    """Return the logging configuration."""
-    return textwrap.dedent("""\
-        // Generated by bind9_setup.py
-        logging {
-            channel default_log {
-                file "/var/log/named/named.log" versions 5 size 50m;
-                severity info;
-                print-time yes;
-                print-severity yes;
-                print-category yes;
-            };
-            channel query_log {
-                file "/var/log/named/query.log" versions 3 size 20m;
-                severity info;
-                print-time yes;
-            };
-            category default { default_log; };
-            category queries { query_log; };
-            category query-errors { default_log; };
-            category security { default_log; };
-            category dnssec { default_log; };
-        };
-    """)
+http local-http-server {{
+    endpoints {{ "/dns-query"; }};
+}};
+{stats_block}"""
 
 
-def generate_named_conf_local(use_rpz: bool) -> str:
-    """Return named.conf.local content."""
-    rpz_zone = ""
+def render_logging_conf() -> str:
+    return """logging {
+    channel "main_log" {
+        file "/var/log/named/named.log" versions 3 size 20m;
+        severity warning;
+        print-category yes;
+        print-severity yes;
+        print-time     yes;
+    };
+    category default { "main_log"; };
+    category queries { "null"; };     // disable query logging (noisy); change to "main_log" to enable
+};
+"""
+
+
+def render_named_conf_local(use_rpz: bool) -> str:
     if use_rpz:
-        rpz_zone = textwrap.dedent("""\
-
-            zone "rpz.local" {
-                type master;
-                file "/etc/bind/zones/db.rpz.local";
-                allow-query { none; };
-            };
-        """)
-    else:
-        rpz_zone = textwrap.dedent("""\
-
-            // RPZ disabled
-            // zone "rpz.local" {
-            //     type master;
-            //     file "/etc/bind/zones/db.rpz.local";
-            //     allow-query { none; };
-            // };
-        """)
-
-    return textwrap.dedent(f"""\
-        // Generated by bind9_setup.py
-        // Local configuration
-        {rpz_zone}
-    """)
-
-
-def generate_named_conf() -> str:
-    """Return the master named.conf that includes other config files."""
-    return textwrap.dedent("""\
-        // Generated by bind9_setup.py — master BIND configuration
-
-        include "/etc/bind/named.conf.options";
-        include "/etc/bind/named.conf.logging";
-        include "/etc/bind/named.conf.local";
-        include "/etc/bind/named.conf.default-zones";
-    """)
-
-
-def generate_rpz_update_script() -> str:
-    """Return the RPZ blocklist update bash script."""
-    blocklist_urls = "\n".join(f'    "{url}"' for url in RPZ_BLOCKLISTS)
-    return textwrap.dedent(f"""\
-        #!/usr/bin/env bash
-        # rpz-update.sh — Fetch and compile RPZ blocklist
-        # Generated by bind9_setup.py — do not edit manually
-        set -euo pipefail
-
-        ZONE_FILE="/etc/bind/zones/db.rpz.local"
-        TMP_HOSTS="$(mktemp)"
-        TMP_ZONE="$(mktemp)"
-        NAMED_COMPILEZONE="$(command -v named-compilezone || echo /usr/sbin/named-compilezone)"
-        RNDC="$(command -v rndc || echo /usr/sbin/rndc)"
-
-        BLOCKLISTS=(
-        {blocklist_urls}
+        return (
+            'zone "rpz.adblock" {\n'
+            "    type primary;\n"
+            '    file "/var/lib/bind/db.rpz.adblock.raw";\n'
+            "    masterfile-format raw;\n"
+            "};\n"
         )
-
-        cleanup() {{
-            rm -f "$TMP_HOSTS" "$TMP_ZONE"
-        }}
-        trap cleanup EXIT
-
-        SERIAL="$(date +%Y%m%d%H)"
-
-        # Header
-        cat > "$TMP_ZONE" <<HEADER
-        \\$TTL 300
-        @  IN  SOA  localhost. admin.localhost. (
-                $SERIAL  ; serial
-                3600     ; refresh
-                600      ; retry
-                86400    ; expire
-                300      ; minimum
-        )
-           IN  NS   localhost.
-        HEADER
-
-        # Fetch and merge blocklists
-        for url in "${{BLOCKLISTS[@]}}"; do
-            curl -sSfL --max-time 30 "$url" >> "$TMP_HOSTS" 2>/dev/null || true
-        done
-
-        # Convert hosts entries to RPZ CNAME records
-        grep -E '^0\\.0\\.0\\.0|^127\\.0\\.0\\.1' "$TMP_HOSTS" \\
-            | awk '{{print $2}}' \\
-            | grep -v 'localhost' \\
-            | sort -u \\
-            | while read -r domain; do
-                # Skip empty/invalid
-                [[ -z "$domain" || "$domain" == "#"* ]] && continue
-                echo "$domain  CNAME  ."
-            done >> "$TMP_ZONE"
-
-        # Validate zone
-        if "$NAMED_COMPILEZONE" -i none -o /dev/null rpz.local "$TMP_ZONE" >/dev/null 2>&1; then
-            cp -f "$TMP_ZONE" "$ZONE_FILE"
-            chown bind:bind "$ZONE_FILE" 2>/dev/null || chown named:named "$ZONE_FILE" 2>/dev/null || true
-            "$RNDC" reload rpz.local 2>/dev/null || "$RNDC" reload 2>/dev/null || true
-            echo "[rpz-update] Zone updated successfully (serial $SERIAL)"
-        else
-            echo "[rpz-update] Zone validation failed — keeping previous version" >&2
-            exit 1
-        fi
-    """)
+    return "// No local zones configured.\n"
 
 
-def generate_rpz_service(config: Config) -> str:
-    """Return the systemd service unit for RPZ updates."""
-    return textwrap.dedent("""\
-        [Unit]
-        Description=RPZ blocklist updater for BIND9
-        After=network-online.target named.service
-        Wants=network-online.target
-
-        [Service]
-        Type=oneshot
-        ExecStart=/usr/local/sbin/rpz-update.sh
-        User=root
-        StandardOutput=journal
-        StandardError=journal
-
-        [Install]
-        WantedBy=multi-user.target
-    """)
-
-
-def generate_rpz_timer(config: Config) -> str:
-    """Return the systemd timer unit for RPZ updates."""
-    return textwrap.dedent(f"""\
-        [Unit]
-        Description=Periodic RPZ blocklist update
-
-        [Timer]
-        OnBootSec=5min
-        OnUnitActiveSec={config.rpz_timer}
-        Persistent=true
-        RandomizedDelaySec=120
-
-        [Install]
-        WantedBy=timers.target
-    """)
-
-
-def generate_certbot_hook(rndc_bin: str) -> str:
-    """Return the certbot renewal deploy hook script."""
-    return textwrap.dedent(f"""\
-        #!/usr/bin/env bash
-        # Certbot renewal deploy hook for BIND9 TLS certificates
-        # Generated by bind9_setup.py
-
-        set -euo pipefail
-
-        BIND_SSL_DIR="/etc/bind/ssl"
-        BIND_USER="$(stat -c '%U' "$BIND_SSL_DIR" 2>/dev/null || echo bind)"
-
-        # Copy renewed certificates
-        cp -f "$RENEWED_LINEAGE/fullchain.pem" "$BIND_SSL_DIR/cert.pem"
-        cp -f "$RENEWED_LINEAGE/privkey.pem"   "$BIND_SSL_DIR/key.pem"
-
-        # Fix ownership and permissions
-        chown "$BIND_USER":"$BIND_USER" "$BIND_SSL_DIR/cert.pem" "$BIND_SSL_DIR/key.pem"
-        chmod 640 "$BIND_SSL_DIR/cert.pem" "$BIND_SSL_DIR/key.pem"
-
-        # Reload BIND
-        {rndc_bin} reload 2>/dev/null || systemctl reload named 2>/dev/null || true
-        echo "[certbot-hook] BIND certificates renewed and reloaded"
-    """)
-
-
-def generate_logrotate_config(rndc_bin: str) -> str:
-    """Return logrotate config for BIND log files."""
-    return textwrap.dedent(f"""\
-        /var/log/named/named.log
-        /var/log/named/query.log {{
-            weekly
-            rotate 8
-            compress
-            delaycompress
-            missingok
-            notifempty
-            create 0640 bind bind
-            postrotate
-                {rndc_bin} reload >/dev/null 2>&1 || true
-            endscript
-        }}
-    """)
-
-
-def generate_named_override(prefix: str) -> str:
-    """Return the systemd override.conf for a non-standard BIND prefix."""
-    return textwrap.dedent(f"""\
-        # Generated by bind9_setup.py
-        [Service]
-        ExecStart=
-        ExecStart={prefix}/sbin/named -f -u bind -c /etc/bind/named.conf
-        ExecReload=
-        ExecReload={prefix}/sbin/rndc reload
-    """)
-
-
-def _generate_rpz_placeholder_zone() -> str:
-    """Return a minimal RPZ zone file used as a placeholder."""
-    serial = time.strftime("%Y%m%d") + "01"
-    return textwrap.dedent(f"""\
-        $TTL 300
-        @  IN  SOA  localhost. admin.localhost. (
-                {serial}  ; serial
-                3600      ; refresh
-                600       ; retry
-                86400     ; expire
-                300       ; minimum
-        )
-           IN  NS   localhost.
-        ; Placeholder — will be populated by rpz-update.sh
-    """)
-
-
-# ---------------------------------------------------------------------------
-# High-level setup steps
-# ---------------------------------------------------------------------------
-
-
-def write_bind_config(config: Config) -> None:
-    """Write all BIND configuration files, backing up existing ones."""
-    LOG.info("Writing BIND configuration files …")
-
-    bind_dir = config.bind_dir
-
-    # Ensure directories exist
-    bind_dir.mkdir(parents=True, exist_ok=True)
-    Path("/var/cache/bind").mkdir(parents=True, exist_ok=True)
-
-    log_dir = Path("/var/log/named")
-    log_dir.mkdir(parents=True, exist_ok=True)
-    uid, gid = _uid_gid(config.bind_user)
-    os.chown(log_dir, uid, gid)
-
-    # Backup existing configs
-    config_files = [
-        bind_dir / "named.conf",
-        bind_dir / "named.conf.options",
-        bind_dir / "named.conf.logging",
-        bind_dir / "named.conf.local",
-    ]
-    for cf in config_files:
-        backup_config(cf)
-
-    # Write configs
-    atomic_write(
-        bind_dir / "named.conf.options",
-        generate_named_conf_options(config),
-        owner=config.bind_user,
-    )
-    atomic_write(
-        bind_dir / "named.conf.logging",
-        generate_named_conf_logging(),
-        owner=config.bind_user,
-    )
-    atomic_write(
-        bind_dir / "named.conf.local",
-        generate_named_conf_local(config.use_rpz),
-        owner=config.bind_user,
-    )
-    atomic_write(
-        bind_dir / "named.conf",
-        generate_named_conf(),
-        owner=config.bind_user,
+def render_named_conf() -> str:
+    return (
+        'include "/etc/bind/named.conf.options";\n'
+        'include "/etc/bind/named.conf.local";\n'
+        'include "/etc/bind/named.conf.default-zones";\n'
+        'include "/etc/bind/named.conf.logging";\n'
     )
 
-    # Logrotate
-    atomic_write(
-        Path("/etc/logrotate.d/named"),
-        generate_logrotate_config(config.rndc_bin),
-    )
 
-    # Check config syntax
-    LOG.info("Validating BIND configuration …")
-    result = run_cmd([config.named_checkconf_bin, str(bind_dir / "named.conf")], check=False, capture=True)
-    if result.returncode != 0:
-        LOG.warning(
-            "named-checkconf reported issues:\n%s",
-            (result.stdout or "") + (result.stderr or ""),
-        )
-    else:
-        LOG.info("named-checkconf: OK ✓")
+def render_placeholder_zone() -> str:
+    return """$TTL 300
+@ SOA localhost. root.localhost. (
+    1       ; serial
+    3600    ; refresh
+    600     ; retry
+    86400   ; expire
+    300 )   ; minimum
+  NS  localhost.
+"""
 
 
-def setup_rpz(config: Config) -> None:
-    """Create placeholder RPZ zone, deploy update script and systemd units."""
-    if not config.use_rpz:
-        LOG.info("RPZ adblocking is disabled — skipping")
-        return
+def render_deploy_hook(rndc_bin: str) -> str:
+    return f"""#!/bin/bash
+# Auto-deployed by bind9_setup.py — copies renewed certs and reloads BIND
+BIND_SSL="/etc/bind/ssl"
+BIND_USER="$(id -un named 2>/dev/null || echo bind)"
 
-    LOG.info("Setting up RPZ adblocking …")
+cp -L "$RENEWED_LINEAGE/fullchain.pem" "$BIND_SSL/fullchain.pem"
+cp -L "$RENEWED_LINEAGE/privkey.pem"   "$BIND_SSL/privkey.pem"
+chown "root:$BIND_USER" "$BIND_SSL/fullchain.pem" "$BIND_SSL/privkey.pem"
+chmod 640                "$BIND_SSL/fullchain.pem" "$BIND_SSL/privkey.pem"
 
-    # Zone directory and placeholder zone
-    zone_dir = config.bind_dir / "zones"
-    zone_dir.mkdir(parents=True, exist_ok=True)
-    uid, gid = _uid_gid(config.bind_user)
-    os.chown(zone_dir, uid, gid)
-
-    zone_file = zone_dir / "db.rpz.local"
-    if not zone_file.exists():
-        atomic_write(
-            zone_file,
-            _generate_rpz_placeholder_zone(),
-            owner=config.bind_user,
-        )
-        LOG.info("Created placeholder RPZ zone at %s", zone_file)
-
-    # Update script
-    script_path = Path("/usr/local/sbin/rpz-update.sh")
-    atomic_write(script_path, generate_rpz_update_script(), mode=0o755)
-    LOG.info("Deployed RPZ update script at %s", script_path)
-
-    # Systemd service
-    svc_path = Path("/etc/systemd/system/rpz-updater.service")
-    atomic_write(svc_path, generate_rpz_service(config))
-
-    # Systemd timer
-    timer_path = Path("/etc/systemd/system/rpz-updater.timer")
-    atomic_write(timer_path, generate_rpz_timer(config))
-
-    run_cmd(["systemctl", "daemon-reload"])
-    run_cmd(["systemctl", "enable", "--now", "rpz-updater.timer"])
-    LOG.info("RPZ systemd timer enabled (interval: %s) ✓", config.rpz_timer)
+"{rndc_bin}" reconfig && echo "[$(date)] BIND reloaded after cert renewal for $RENEWED_LINEAGE." \\
+  || echo "[$(date)] WARNING: rndc reconfig failed after renewal."
+"""
 
 
-def configure_firewall(config: Config) -> None:
-    """Add firewall rules for DNS, DoT, and optionally DoH."""
-    if config.skip_firewall:
-        LOG.info("Firewall configuration skipped (--skip-firewall)")
-        return
+def render_rpz_script() -> str:
+    return r"""#!/bin/bash
+# RPZ adblock zone updater — hagezi/dns-blocklists pro
+# Managed by systemd rpz-updater.service / rpz-updater.timer
+set -euo pipefail
 
-    LOG.info("Configuring firewall rules …")
+# Dynamic util paths
+NAMED_COMPILEZONE_BIN=$(which named-compilezone 2>/dev/null || echo "/usr/sbin/named-compilezone")
+RNDC_BIN=$(which rndc 2>/dev/null || echo "/usr/sbin/rndc")
 
-    ports = [
-        ("53", "tcp", "DNS"),
-        ("53", "udp", "DNS"),
-        ("853", "tcp", "DoT"),
-    ]
-    if config.doh_enabled:
-        ports.append(("443", "tcp", "DoH"))
+URL="https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/rpz/pro.txt"
+ZONE_NAME="rpz.adblock"
+BIND_DIR="/var/lib/bind"
+TEXT_FILE="$BIND_DIR/db.rpz.adblock.txt"
+RAW_FILE="$BIND_DIR/db.rpz.adblock.raw"
+KEY_FILE="/etc/bind/rndc.key"
 
-    # Detect firewall tool
-    ufw_bin = shutil.which("ufw")
-    if ufw_bin:
-        for port, proto, label in ports:
-            run_cmd(
-                ["ufw", "allow", f"{port}/{proto}", "comment", f"BIND9 {label}"],
-                check=False,
-            )
-        LOG.info("UFW rules added ✓")
-        return
+# Temp files on the same filesystem as the destination — ensures atomic mv
+TEMP_FILE=$(mktemp -p "$BIND_DIR")
+TEMP_RAW=$(mktemp -p "$BIND_DIR")
 
-    iptables_bin = shutil.which("iptables")
-    if iptables_bin:
-        for port, proto, label in ports:
-            # Check if rule already exists
-            check = run_cmd(
-                [
-                    "iptables",
-                    "-C",
-                    "INPUT",
-                    "-p",
-                    proto,
-                    "--dport",
-                    port,
-                    "-j",
-                    "ACCEPT",
-                ],
-                check=False,
-                capture=True,
-            )
-            if check.returncode != 0:
-                run_cmd(
-                    [
-                        "iptables",
-                        "-A",
-                        "INPUT",
-                        "-p",
-                        proto,
-                        "--dport",
-                        port,
-                        "-j",
-                        "ACCEPT",
-                        "-m",
-                        "comment",
-                        "--comment",
-                        f"BIND9 {label}",
-                    ],
-                    check=False,
-                )
-        # Also for ip6tables
-        ip6tables_bin = shutil.which("ip6tables")
-        if ip6tables_bin:
-            for port, proto, label in ports:
-                check6 = run_cmd(
-                    [
-                        "ip6tables",
-                        "-C",
-                        "INPUT",
-                        "-p",
-                        proto,
-                        "--dport",
-                        port,
-                        "-j",
-                        "ACCEPT",
-                    ],
-                    check=False,
-                    capture=True,
-                )
-                if check6.returncode != 0:
-                    run_cmd(
-                        [
-                            "ip6tables",
-                            "-A",
-                            "INPUT",
-                            "-p",
-                            proto,
-                            "--dport",
-                            port,
-                            "-j",
-                            "ACCEPT",
-                            "-m",
-                            "comment",
-                            "--comment",
-                            f"BIND9 {label}",
-                        ],
-                        check=False,
-                    )
-        LOG.info("iptables rules added ✓")
-        return
+cleanup() {
+    rm -f "$TEMP_FILE" "$TEMP_RAW"
+}
+trap cleanup EXIT
 
-    LOG.warning("No supported firewall tool found (ufw or iptables) — skipping")
+if ! curl -sS -f --connect-timeout 10 --max-time 180 \
+        --retry 3 --retry-all-errors --retry-delay 5 \
+        -o "$TEMP_FILE" "$URL"; then
+    echo "Error: Download failed." >&2
+    exit 1
+fi
+
+if [ ! -s "$TEMP_FILE" ]; then
+    echo "Error: Downloaded file is empty." >&2
+    exit 1
+fi
+
+[ -f "$TEXT_FILE" ] || touch "$TEXT_FILE"
+
+if cmp -s "$TEMP_FILE" "$TEXT_FILE"; then
+    echo "No changes detected. Skipping update."
+    exit 0
+fi
+
+echo "Update detected. Compiling zone..."
+
+if ! "$NAMED_COMPILEZONE_BIN" -f text -F raw -q -o "$TEMP_RAW" "$ZONE_NAME" "$TEMP_FILE"; then
+    echo "Error: Zone compilation failed." >&2
+    exit 1
+fi
+
+chmod 644 "$TEMP_RAW" "$TEMP_FILE"
+
+# Atomic replacement (same filesystem guaranteed by mktemp -p)
+mv "$TEMP_RAW" "$RAW_FILE"
+mv "$TEMP_FILE" "$TEXT_FILE"
+
+if "$RNDC_BIN" -k "$KEY_FILE" reload "$ZONE_NAME"; then
+    echo "Zone $ZONE_NAME reloaded successfully."
+else
+    echo "Error: rndc reload failed." >&2
+    exit 1
+fi
+"""
 
 
-def start_bind() -> None:
-    """Enable and restart the BIND9 named service."""
-    LOG.info("Starting BIND9 …")
-    run_cmd(["systemctl", "enable", "named"], check=False)
-    # Also try bind9 service name (Debian/Ubuntu default)
-    run_cmd(["systemctl", "enable", "bind9"], check=False)
-    run_cmd(["systemctl", "restart", "named"], check=False)
-    # Fallback to bind9 service name
-    run_cmd(["systemctl", "restart", "bind9"], check=False)
+def render_rpz_service(rpz_script: str, bind_user: str) -> str:
+    return f"""[Unit]
+Description=Update RPZ adblock zone (hagezi/dns-blocklists pro)
+After=network-online.target named.service
+Wants=network-online.target
 
-    # Wait a moment for the service to start
-    time.sleep(2)
+[Service]
+Type=oneshot
+User={bind_user}
+Group={bind_user}
+ExecStart={rpz_script}
 
-    # Verify
-    result_named = run_cmd(
-        ["systemctl", "is-active", "--quiet", "named"], check=False
-    )
-    result_bind9 = run_cmd(
-        ["systemctl", "is-active", "--quiet", "bind9"], check=False
-    )
-    if result_named.returncode == 0 or result_bind9.returncode == 0:
-        LOG.info("BIND9 is running ✓")
-    else:
-        LOG.error("BIND9 does not appear to be running!")
-        LOG.error("Check 'systemctl status named' or 'journalctl -xeu named'")
-        raise SetupError("BIND9 failed to start")
+# Hardening
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+StateDirectory=bind
+ReadWritePaths=/var/lib/bind /etc/bind
+"""
 
 
-def run_initial_rpz_update() -> None:
-    """Trigger the initial RPZ blocklist update."""
-    LOG.info("Running initial RPZ blocklist update …")
-    result = run_cmd(
-        ["systemctl", "start", "rpz-updater.service"], check=False
-    )
-    if result.returncode == 0:
-        LOG.info("Initial RPZ update triggered ✓")
-    else:
-        LOG.warning("Initial RPZ update may have failed — check 'journalctl -u rpz-updater'")
+def render_rpz_timer(rpz_timer: str) -> str:
+    return f"""[Unit]
+Description=Timer for RPZ adblock zone update
+
+[Timer]
+OnCalendar={rpz_timer}
+Unit=rpz-updater.service
+RandomizedDelaySec=300
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+"""
 
 
-def run_smoke_test(domain: str) -> None:
-    """Run a quick dig test against the local resolver."""
-    LOG.info("Running smoke test …")
-    dig_bin = shutil.which("dig") or "dig"
-    result = run_cmd(
-        [dig_bin, "@127.0.0.1", "example.com", "A", "+short"],
-        capture=True,
-        check=False,
-    )
-    if result.returncode == 0 and result.stdout.strip():
-        LOG.info("Smoke test passed ✓  — example.com → %s", result.stdout.strip())
-    else:
-        LOG.warning("Smoke test: dig returned no answer — DNS may not be fully ready yet")
-
-    # Test DoT if domain is available
-    if domain:
-        result_dot = run_cmd(
-            [
-                dig_bin,
-                "@127.0.0.1",
-                "-p",
-                "853",
-                "+tls",
-                "example.com",
-                "A",
-                "+short",
-            ],
-            capture=True,
-            check=False,
-        )
-        if result_dot.returncode == 0 and result_dot.stdout.strip():
-            LOG.info("DoT test passed ✓  — example.com → %s", result_dot.stdout.strip())
-        else:
-            LOG.debug("DoT test did not return an answer (may need TLS config)")
+def render_named_override(prefix: str) -> str:
+    return f"""[Service]
+ExecStart=
+ExecStart={prefix}/sbin/named -f -u bind -c /etc/bind/named.conf
+"""
 
 
-def print_summary(config: Config) -> None:
-    """Print a final summary of the setup."""
-    sep = "=" * 60
-    lines = [
-        "",
-        sep,
-        "  BIND9 DoT/DoH Setup Complete",
-        sep,
-        "",
-        f"  Domain:          {config.domain or '(none — TLS disabled)'}",
-        f"  Forwarders:      {config.fwd1}, {config.fwd2}",
-        f"  RPZ adblocking:  {'enabled' if config.use_rpz else 'disabled'}",
-        f"  Statistics:      {'enabled (port 8053)' if config.use_stats else 'disabled'}",
-        f"  DNS-over-TLS:    {'enabled (port 853)' if config.domain else 'disabled'}",
-        f"  DNS-over-HTTPS:  {'enabled (port 443)' if config.doh_enabled else 'disabled'}",
-        f"  Install mode:    {config.install_mode}",
-        f"  BIND prefix:     {config.bind_prefix}",
-        f"  BIND user:       {config.bind_user}",
-        "",
-        "  Endpoints:",
-        f"    DNS:    {config.domain or 'localhost'} port 53",
-    ]
-    if config.domain:
-        lines.append(f"    DoT:    tls://{config.domain}:853")
-    if config.doh_enabled and config.domain:
-        lines.append(f"    DoH:    https://{config.domain}/dns-query")
-    lines += [
-        "",
-        "  Config files:",
-        f"    {config.bind_dir / 'named.conf'}",
-        f"    {config.bind_dir / 'named.conf.options'}",
-        f"    {config.bind_dir / 'named.conf.logging'}",
-        f"    {config.bind_dir / 'named.conf.local'}",
-    ]
-    if config.use_rpz:
-        lines += [
-            f"    {config.bind_dir / 'zones' / 'db.rpz.local'}",
-            "    /usr/local/sbin/rpz-update.sh",
-        ]
-    if config.domain:
-        lines.append(f"    {config.bind_ssl_dir / 'cert.pem'}")
-        lines.append(f"    {config.bind_ssl_dir / 'key.pem'}")
-    lines += [
-        "",
-        "  Useful commands:",
-        "    systemctl status named",
-        "    journalctl -feu named",
-        f"    {config.rndc_bin or 'rndc'} status",
-        "    dig @127.0.0.1 example.com",
-    ]
-    if config.use_rpz:
-        lines += [
-            "    systemctl start rpz-updater.service   # manual RPZ update",
-            "    systemctl status rpz-updater.timer     # check timer",
-        ]
-    lines += [
-        "",
-        sep,
-    ]
-    print("\n".join(lines))
+def render_logrotate(rndc_bin: str) -> str:
+    return f"""/var/log/named/named.log {{
+    weekly
+    rotate 4
+    compress
+    missingok
+    notifempty
+    create 640 bind bind
+    postrotate
+        {rndc_bin} reopen > /dev/null 2>&1 || true
+    endscript
+}}
+"""
 
 
-# ---------------------------------------------------------------------------
-# Interactive prompting
-# ---------------------------------------------------------------------------
-
-
-def _prompt(message: str, default: str = "") -> str:
-    """Prompt the user for input with an optional default."""
+# ── Interactive prompts ──────────────────────────────────────────────────────
+def prompt(question: str, default: str = "") -> str:
+    q = question
     if default:
-        raw = input(f"{message} [{default}]: ").strip()
-        return raw if raw else default
-    return input(f"{message}: ").strip()
+        q += f" [{default}]"
+    reply = input(f"  {q}: ").strip()
+    return reply or default
 
 
-def _prompt_yes_no(message: str, default: bool = True) -> bool:
-    """Prompt for a yes/no answer."""
-    suffix = " [Y/n]" if default else " [y/N]"
-    raw = input(f"{message}{suffix}: ").strip().lower()
-    if not raw:
-        return default
-    return raw in ("y", "yes")
+def ask_yes(question: str) -> bool:
+    return input(f"  {question}: ").strip().lower().startswith("y")
 
 
-def _prompt_choice(message: str, choices: list[str], default: str = "") -> str:
-    """Prompt the user to pick from a list of choices."""
-    print(message)
-    for i, choice in enumerate(choices, 1):
-        marker = " *" if choice == default else ""
-        print(f"  {i}) {choice}{marker}")
-    while True:
-        raw = input(f"Enter choice [1-{len(choices)}]: ").strip()
-        if not raw and default:
-            return default
-        try:
-            idx = int(raw)
-            if 1 <= idx <= len(choices):
-                return choices[idx - 1]
-        except ValueError:
-            # Maybe they typed the version string directly
-            if raw in choices:
-                return raw
-        print(f"  Invalid choice. Please enter 1-{len(choices)}.")
+def write_file(path: str, content: str, *, mode: int | None = None) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as fh:
+        fh.write(content)
+    if mode is not None:
+        os.chmod(path, mode)
 
 
-def gather_config_interactive(args: argparse.Namespace) -> Config:
-    """Build a Config from CLI args, prompting interactively for missing values."""
-    config = Config()
-
-    # Domain
-    if args.domain:
-        config.domain = args.domain
-    elif not args.non_interactive:
-        config.domain = _prompt(
-            "Enter your domain name for TLS (leave blank to skip TLS)", ""
-        )
-
-    # Forwarders
-    config.fwd1 = args.fwd1 or (
-        _prompt("Upstream forwarder #1", DEFAULT_FWD1)
-        if not args.non_interactive
-        else DEFAULT_FWD1
-    )
-    config.fwd2 = args.fwd2 or (
-        _prompt("Upstream forwarder #2", DEFAULT_FWD2)
-        if not args.non_interactive
-        else DEFAULT_FWD2
-    )
-
-    # RPZ
-    if args.rpz is not None:
-        config.use_rpz = args.rpz
-    elif not args.non_interactive:
-        config.use_rpz = _prompt_yes_no("Enable RPZ adblocking?", True)
-
-    # RPZ timer interval
-    config.rpz_timer = args.rpz_timer or (
-        _prompt("RPZ update interval (systemd OnUnitActiveSec)", DEFAULT_RPZ_TIMER)
-        if not args.non_interactive and config.use_rpz
-        else DEFAULT_RPZ_TIMER
-    )
-
-    # Stats
-    if args.stats is not None:
-        config.use_stats = args.stats
-    elif not args.non_interactive:
-        config.use_stats = _prompt_yes_no("Enable BIND statistics channel?", False)
-
-    # Install mode
-    if args.install_mode:
-        config.install_mode = args.install_mode
-    elif not args.non_interactive:
-        mode = _prompt_choice(
-            "BIND installation mode:",
-            ["apt", "source"],
-            default="apt",
-        )
-        config.install_mode = mode
-
-    # BIND version (for source build)
-    if config.install_mode == "source":
-        available_versions = fetch_bind_versions()
-        if args.bind_version:
-            config.bind_version = args.bind_version
-        elif not args.non_interactive:
-            display = available_versions[:10]  # show top 10
-            config.bind_version = _prompt_choice(
-                "Select BIND version to build:",
-                display,
-                default=display[0] if display else BIND_VERSION_FALLBACK[0],
-            )
-        else:
-            config.bind_version = available_versions[0] if available_versions else BIND_VERSION_FALLBACK[0]
-
-    # BIND prefix
-    config.bind_prefix = args.bind_prefix or (
-        _prompt("BIND install prefix", DEFAULT_BIND_PREFIX)
-        if not args.non_interactive and config.install_mode == "source"
-        else DEFAULT_BIND_PREFIX
-    )
-
-    config.skip_certbot = args.skip_certbot
-    config.skip_firewall = args.skip_firewall
-    config.non_interactive = args.non_interactive
-
-    return config
-
-
-# ---------------------------------------------------------------------------
-# Main orchestrator
-# ---------------------------------------------------------------------------
-
-
-def build_argparser() -> argparse.ArgumentParser:
-    """Construct the CLI argument parser."""
-    p = argparse.ArgumentParser(
-        description="Set up BIND9 with DoT/DoH and optional RPZ adblocking",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=textwrap.dedent("""\
-            Examples:
-              # Fully interactive:
-              sudo python3 bind9_setup.py
-
-              # Non-interactive, apt mode:
-              sudo python3 bind9_setup.py --non-interactive --domain dns.example.com
-
-              # Source build, specific version:
-              sudo python3 bind9_setup.py --install-mode source --bind-version 9.20.7
-
-              # Minimal (no TLS, no RPZ):
-              sudo python3 bind9_setup.py --non-interactive --rpz false --skip-certbot
-        """),
-    )
-    p.add_argument("--domain", help="Domain name for TLS certificate")
-    p.add_argument("--fwd1", help=f"Primary upstream forwarder (default: {DEFAULT_FWD1})")
-    p.add_argument("--fwd2", help=f"Secondary upstream forwarder (default: {DEFAULT_FWD2})")
-    p.add_argument(
-        "--rpz",
-        type=lambda v: v.lower() in ("true", "1", "yes"),
-        default=None,
-        help="Enable RPZ adblocking (true/false)",
-    )
-    p.add_argument("--rpz-timer", help=f"RPZ update interval (default: {DEFAULT_RPZ_TIMER})")
-    p.add_argument(
-        "--stats",
-        type=lambda v: v.lower() in ("true", "1", "yes"),
-        default=None,
-        help="Enable BIND statistics channel (true/false)",
-    )
-    p.add_argument(
-        "--install-mode",
-        choices=["apt", "source"],
-        help="Install BIND via apt or build from source",
-    )
-    p.add_argument("--bind-version", help="BIND version to build (source mode)")
-    p.add_argument("--bind-prefix", help=f"Install prefix for source build (default: {DEFAULT_BIND_PREFIX})")
-    p.add_argument(
-        "--non-interactive",
-        action="store_true",
-        help="Run without interactive prompts (use defaults for unset options)",
-    )
-    p.add_argument("--skip-certbot", action="store_true", help="Skip TLS certificate obtainment")
-    p.add_argument("--skip-firewall", action="store_true", help="Skip firewall rule configuration")
-    p.add_argument("--debug", action="store_true", help="Enable debug logging")
-    p.add_argument(
-        "--reinstall",
-        action="store_true",
-        help="Force reinstall from source even if BIND9 is already installed",
-    )
-    return p
-
-
-def main() -> None:
-    """Entry point — orchestrates the full BIND9 setup."""
-    parser = build_argparser()
-    args = parser.parse_args()
-
-    setup_logging(debug=args.debug)
-
-    # Root check
-    if os.geteuid() != 0:
-        LOG.critical("This script must be run as root (use sudo).")
-        sys.exit(1)
-
-    LOG.info("=== BIND9 DoT/DoH Setup ===")
-
-    # ---- Step 1: Gather configuration ----
-    try:
-        config = gather_config_interactive(args)
-    except (KeyboardInterrupt, EOFError):
-        print()
-        LOG.info("Setup cancelled by user.")
-        sys.exit(0)
-
-    LOG.info("Configuration:")
-    LOG.info("  Domain:       %s", config.domain or "(none)")
-    LOG.info("  Forwarders:   %s, %s", config.fwd1, config.fwd2)
-    LOG.info("  RPZ:          %s", config.use_rpz)
-    LOG.info("  Stats:        %s", config.use_stats)
-    LOG.info("  Install mode: %s", config.install_mode)
-    if config.install_mode == "source":
-        LOG.info("  BIND version: %s", config.bind_version)
-        LOG.info("  Prefix:       %s", config.bind_prefix)
-
-    # ---- Step 1b: Detect existing BIND9 and handle reinstall ----
-    if args.reinstall:
-        config.install_mode = "source"
-        is_installed, version_str = detect_existing_bind(config)
-        if is_installed:
-            LOG.warning("--reinstall: existing BIND9 found: %s", version_str)
-            if is_bind_from_apt():
-                remove_apt_bind()
-            else:
-                LOG.info("Existing BIND9 is not from apt; will override via systemd unit")
+# ── Phases ───────────────────────────────────────────────────────────────────
+async def detect_existing_bind(cfg: Config) -> None:
+    """Offer a source reinstall when BIND is already present."""
+    if not shutil.which("named"):
+        return
+    _, out = await run("named", "-v", check=False, capture=True)
+    warn(f"Existing BIND9 detected: {out.strip().splitlines()[0] if out.strip() else 'unknown'}")
+    if not ask_yes("Do you want to reinstall BIND9 from source? [y/N]"):
+        info("Keeping existing BIND9 installation.")
+        return
+    code, dpkg_out = await run("dpkg", "-l", "bind9", check=False, capture=True)
+    if code == 0 and any(line.startswith("ii") for line in dpkg_out.splitlines()):
+        info("Existing BIND9 was installed via apt. Removing apt packages first...")
+        await run_ok("systemctl", "stop", "named")
+        await run_ok("systemctl", "stop", "bind9")
+        await run_ok("apt-get", "remove", "--purge", "-y", "bind9", "bind9utils", "bind9-utils")
+        await run_ok("apt-get", "autoremove", "-y")
+        ok("Apt-installed BIND9 packages removed.")
     else:
-        handle_existing_bind(config)
+        info("Existing BIND9 is not from apt (likely a previous source build).")
+        info("The new source build will override it via the systemd unit.")
+    cfg.force_source_reinstall = True
 
-    # ---- Step 2: Install packages ----
-    try:
-        if config.install_mode == "apt":
-            install_packages(REQUIRED_APT_PACKAGES)
+
+async def gather_config(cfg: Config, versions_task: asyncio.Task) -> None:
+    header("Configuration")
+
+    cfg.domain = prompt("Domain for DoT/DoH (e.g. dns.example.com)", "")
+    if not cfg.domain:
+        die("Domain is required.")
+
+    cfg.fwd1 = prompt("Upstream forwarder 1", "8.8.8.8")
+    cfg.fwd2 = prompt("Upstream forwarder 2", "1.1.1.1")
+
+    cfg.use_rpz = ask_yes("Enable RPZ adblock (hagezi/dns-blocklists pro list)? [y/N]")
+    if cfg.use_rpz:
+        cfg.rpz_timer = prompt("RPZ timer schedule (systemd OnCalendar)", "*-*-* 04:00:00")
+
+    cfg.use_stats = ask_yes("Enable statistics channel on 127.0.0.1:8053? [y/N]")
+
+    print()
+    print(f"  {BOLD}Where should BIND9 come from?{NC}")
+    print("    1) Distro mirror (apt)          — fast, whatever your release ships")
+    print("    2) Build a specific version from ISC source")
+    choice = prompt("Choose 1 or 2", "1")
+
+    if cfg.force_source_reinstall:
+        cfg.install_mode = "source"
+        choice = "2"
+
+    if choice == "2" or cfg.install_mode == "source":
+        cfg.install_mode = "source"
+        info("Fetching available BIND9 versions from downloads.isc.org ...")
+        versions, online = await versions_task
+        if not online:
+            warn("Could not reach ISC mirror — offering a built-in fallback list.")
+
+        print()
+        print(f"  {BOLD}Available BIND9 versions{NC} (newest first):")
+        shown = versions[:15]
+        for i, ver in enumerate(shown, start=1):
+            print(f"    {i:2d}) {ver}")
+        sel = prompt("Select a version number (or type an exact version)", "1")
+        if sel.isdigit() and 1 <= int(sel) <= len(shown):
+            cfg.bind_src_ver = shown[int(sel) - 1]
+        elif re.fullmatch(r"9\.\d+\.\d+", sel):
+            cfg.bind_src_ver = sel
         else:
-            install_packages(SOURCE_BUILD_DEPS)
-    except SetupError as exc:
-        LOG.error("Package installation failed: %s", exc)
-        LOG.exception("Details:")
-        sys.exit(1)
+            die(f"Invalid selection: '{sel}'.")
 
-    # ---- Step 3: Source build (if selected) ----
-    if config.install_mode == "source":
+        print()
+        if ask_yes("Overwrite the distro BIND binaries in /usr? [y/N]"):
+            cfg.bind_prefix = "/usr"
+        else:
+            cfg.bind_prefix = "/usr/local"
+
+    print()
+    print(f"  {BOLD}Domain:{NC}     {cfg.domain}")
+    print(f"  {BOLD}Forwarders:{NC} {cfg.fwd1} / {cfg.fwd2}")
+    if cfg.install_mode == "source":
+        print(f"  {BOLD}BIND9:{NC}      build {cfg.bind_src_ver} from source (prefix {cfg.bind_prefix})")
+    else:
+        print(f"  {BOLD}BIND9:{NC}      distro mirror (apt)")
+    print(f"  {BOLD}RPZ:{NC}        {'enabled (' + cfg.rpz_timer + ')' if cfg.use_rpz else 'disabled'}")
+    print(f"  {BOLD}Stats:{NC}      {'enabled' if cfg.use_stats else 'disabled'}")
+    print()
+    if input("  Proceed? [Y/n]: ").strip().lower().startswith("n"):
+        raise SystemExit(0)
+
+
+async def install_packages(cfg: Config) -> None:
+    header("Installing packages")
+    env = {**os.environ, "DEBIAN_FRONTEND": "noninteractive"}
+    await run("apt-get", "update", "-qq", env=env)
+    await run(
+        "apt-get", "install", "-y",
+        "bind9", "bind9utils", "dnsutils", "certbot", "curl", "util-linux",
+        env=env,
+    )
+    ok("Base packages installed.")
+
+
+async def build_bind_from_source(cfg: Config, ver: str, prefix: str) -> None:
+    """Compile BIND9 from the ISC tarball with DoH (libnghttp2) support."""
+    base = f"{ISC_BASE}/{ver}"
+    tarball = f"bind-{ver}.tar.xz"
+    header(f"Building BIND {ver} from source (prefix {prefix})")
+
+    info("Installing build dependencies...")
+    env = {**os.environ, "DEBIAN_FRONTEND": "noninteractive"}
+    await run(
+        "apt-get", "install", "-y",
+        "build-essential", "pkg-config", "xz-utils", "perl",
+        "libssl-dev", "libuv1-dev", "libcap-dev", "libnghttp2-dev",
+        "libxml2-dev", "libjson-c-dev", "liburcu-dev", "libjemalloc-dev",
+        "liblmdb-dev", "libmaxminddb-dev",
+        "meson", "ninja-build", "python3-pip",
+        env=env,
+    )
+
+    work = tempfile.mkdtemp()
+    try:
+        tar_path = os.path.join(work, tarball)
+        info(f"Downloading {tarball} ...")
+        # Fetch the tarball and its checksum file concurrently.
+        dl_task = asyncio.create_task(curl_download(f"{base}/{tarball}", tar_path))
+        sum_task = asyncio.create_task(
+            curl_download(f"{base}/{tarball}.sha512.asc",
+                          tar_path + ".sha512.asc", max_time=30)
+        )
+        if not await dl_task:
+            die(f"Download failed: {base}/{tarball}")
+
+        if await sum_task:
+            want = ""
+            with open(tar_path + ".sha512.asc") as fh:
+                m = re.search(r"[0-9a-f]{128}", fh.read())
+                if m:
+                    want = m.group(0)
+            if want:
+                _, got_out = await run("sha512sum", tar_path, capture=True)
+                got = got_out.split()[0]
+                if want != got:
+                    die(f"Checksum mismatch for {tarball} (expected {want}, got {got}).")
+                ok("Checksum verified.")
+            else:
+                warn("No checksum found in published file; skipping verification.")
+        else:
+            warn("Could not fetch checksum file; skipping verification.")
+
+        info("Extracting...")
+        await run("tar", "-xf", tar_path, "-C", work)
+        src = os.path.join(work, f"bind-{ver}")
+        if not os.path.isdir(src):
+            die(f"Unexpected tarball layout: {src} not found.")
+
+        if os.path.isfile(os.path.join(src, "meson.build")):
+            info("Detected meson build system (BIND 9.21+).")
+            meson_args = (
+                ["--prefix=/usr", "--sysconfdir=/etc/bind", "--localstatedir=/var"]
+                if prefix == "/usr" else [f"--prefix={prefix}"]
+            )
+            info(f"Configuring (meson setup {' '.join(meson_args)}) ...")
+            if not await run_ok("meson", "setup",
+                                os.path.join(src, "builddir"), src, *meson_args):
+                die("meson setup failed — check the build output above.")
+
+            info("Compiling (this can take several minutes)...")
+            if not await run_ok("ninja", "-C", os.path.join(src, "builddir"),
+                                f"-j{os.cpu_count() or 1}"):
+                die("ninja build failed.")
+
+            info("Cleaning up old BIND binaries to prevent meson install conflicts...")
+            for binname in BIND_BINARIES:
+                for d in (f"{prefix}/bin", f"{prefix}/sbin", "/usr/bin", "/usr/sbin"):
+                    try:
+                        os.remove(os.path.join(d, binname))
+                    except OSError:
+                        pass
+
+            if not await run_ok("meson", "install", "-C", os.path.join(src, "builddir")):
+                die("meson install failed.")
+        elif os.path.isfile(os.path.join(src, "configure")):
+            info("Detected autotools build system (BIND ≤9.20).")
+            cfg_args = ["--with-libnghttp2"]
+            if prefix == "/usr":
+                cfg_args += ["--prefix=/usr", "--sysconfdir=/etc/bind", "--localstatedir=/var"]
+            else:
+                cfg_args += [f"--prefix={prefix}"]
+            info(f"Configuring ({' '.join(cfg_args)}) ...")
+            if not await run_ok("./configure", *cfg_args, cwd=src):
+                die("./configure failed — check the build output above.")
+            info("Compiling (this can take several minutes)...")
+            if not await run_ok("make", f"-j{os.cpu_count() or 1}", cwd=src):
+                die("make failed.")
+            if not await run_ok("make", "install", cwd=src):
+                die("make install failed.")
+        else:
+            die(f"Cannot determine build system: neither meson.build nor configure found in {src}")
+
+        await run("ldconfig")
+
+        if prefix != "/usr":
+            write_file(
+                "/etc/systemd/system/named.service.d/override.conf",
+                render_named_override(prefix),
+            )
+            await run("systemctl", "daemon-reload")
+            cfg.extra_path = [f"{prefix}/sbin", f"{prefix}/bin"]
+            os.environ["PATH"] = os.pathsep.join(cfg.extra_path + [os.environ.get("PATH", "")])
+            ok(f"named.service repointed to {prefix}/sbin/named.")
+
+        _, vout = await run(f"{prefix}/sbin/named", "-v", check=False, capture=True)
+        ok(f"BIND {ver} installed: {vout.strip().splitlines()[0] if vout.strip() else ver}")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def which_or(name: str, fallback: str, extra_path: list[str]) -> str:
+    path = os.pathsep.join(extra_path + [os.environ.get("PATH", "")]) if extra_path else None
+    return shutil.which(name, path=path) or fallback
+
+
+async def resolve_bind(cfg: Config) -> None:
+    """Resolve util paths, verify version and enable DoH where supported."""
+    cfg.named_compilezone = which_or("named-compilezone", "/usr/sbin/named-compilezone", cfg.extra_path)
+    cfg.rndc = which_or("rndc", "/usr/sbin/rndc", cfg.extra_path)
+
+    _, vout = await run("named", "-v", check=False, capture=True)
+    parsed = parse_named_version(vout)
+    major, minor = parsed if parsed else (0, 0)
+    info(f"Detected BIND {major}.{minor}")
+
+    if cfg.install_mode != "source" and not doh_supported(major, minor):
+        warn(f"BIND {major}.{minor} detected — DoH (port 443) requires BIND 9.18+.")
+        warn("DoT (port 853) will still work. Trying to install bind9 from backports...")
+        codename = ""
         try:
-            build_bind_from_source(config.bind_version, config.bind_prefix)
-        except SetupError as exc:
-            LOG.error("Source build failed: %s", exc)
-            LOG.exception("Details:")
-            sys.exit(1)
+            with open("/etc/os-release") as fh:
+                osrel = fh.read()
+            m = re.search(r"VERSION_CODENAME=([^\n]+)", osrel)
+            if m:
+                codename = m.group(1).strip().strip('"')
+            is_debian = "debian" in osrel.lower()
+        except OSError:
+            is_debian = False
+        if codename and is_debian:
+            write_file(
+                "/etc/apt/sources.list.d/backports.list",
+                f"deb http://deb.debian.org/debian {codename}-backports main\n",
+            )
+            await run("apt-get", "update", "-qq")
+            if await run_ok("apt-get", "install", "-y", "-t",
+                            f"{codename}-backports", "bind9", "bind9utils"):
+                ok("Updated BIND from backports.")
+            else:
+                warn(f"Backports install failed; continuing with {major}.{minor}.")
+        _, vout = await run("named", "-v", check=False, capture=True)
+        parsed = parse_named_version(vout)
+        major, minor = parsed if parsed else (major, minor)
 
-    # ---- Step 4: Detect BIND user and resolve binaries ----
-    config.bind_user = detect_bind_user()
-    config.rndc_bin = resolve_binary("rndc", config.bind_prefix)
-    config.named_compilezone_bin = resolve_binary("named-compilezone", config.bind_prefix)
-    config.named_checkconf_bin = resolve_binary("named-checkconf", config.bind_prefix)
-    LOG.debug("rndc:               %s", config.rndc_bin)
-    LOG.debug("named-compilezone:  %s", config.named_compilezone_bin)
-    LOG.debug("named-checkconf:    %s", config.named_checkconf_bin)
+    cfg.doh_enabled = doh_supported(major, minor)
+    if cfg.doh_enabled:
+        ok(f"DoH support confirmed (BIND {major}.{minor}).")
+    else:
+        warn(f"DoH disabled (BIND {major}.{minor} < 9.18). DoT + plain DNS will work.")
 
-    # ---- Step 5: Check BIND version / DoH support ----
-    try:
-        check_bind_version(config)
-    except SetupError as exc:
-        LOG.warning("BIND version check issue: %s", exc)
-        config.doh_enabled = False
+    _, uid_out = await run("id", "-un", "named", check=False, capture=True)
+    cfg.bind_user = uid_out.strip() or "bind"
+    return None
 
-    # ---- Step 6: Obtain TLS certificate ----
-    if config.domain and not config.skip_certbot:
+
+async def obtain_certificate(cfg: Config) -> None:
+    header("Obtaining TLS certificate via certbot")
+    info(f"Domain {cfg.domain} must resolve to this server and port 80 must be reachable.")
+
+    stopped_svc = ""
+    for svc in ("nginx", "apache2", "lighttpd", "caddy"):
+        if await run_ok("systemctl", "is-active", "--quiet", svc):
+            stopped_svc = svc
+            await run("systemctl", "stop", svc)
+            warn(f"Temporarily stopped {svc} to free port 80.")
+            break
+
+    if not await run_ok(
+        "certbot", "certonly", "--standalone", "--non-interactive",
+        "--agree-tos", "--register-unsafely-without-email", "-d", cfg.domain,
+    ):
+        die(f"Certbot failed. Verify that {cfg.domain} points here and port 80/tcp is open.")
+
+    if stopped_svc:
+        await run("systemctl", "start", stopped_svc)
+        ok(f"Restarted {stopped_svc}.")
+
+    cert_src = f"/etc/letsencrypt/live/{cfg.domain}"
+    os.makedirs(cfg.bind_ssl, exist_ok=True)
+    for fname in ("fullchain.pem", "privkey.pem"):
+        shutil.copyfile(f"{cert_src}/{fname}", f"{cfg.bind_ssl}/{fname}")
+    await run("chown", f"root:{cfg.bind_user}",
+              f"{cfg.bind_ssl}/fullchain.pem", f"{cfg.bind_ssl}/privkey.pem")
+    for fname in ("fullchain.pem", "privkey.pem"):
+        os.chmod(f"{cfg.bind_ssl}/{fname}", 0o640)
+    ok(f"Certificate installed to {cfg.bind_ssl}.")
+
+    write_file(
+        "/etc/letsencrypt/renewal-hooks/deploy/bind9-reload.sh",
+        render_deploy_hook(cfg.rndc), mode=0o755,
+    )
+    ok("Certbot renewal hook installed.")
+
+
+async def write_bind_config(cfg: Config) -> None:
+    header("Writing BIND9 configuration")
+
+    for f in ("named.conf", "named.conf.options", "named.conf.local"):
+        path = f"{cfg.bind_dir}/{f}"
+        if os.path.isfile(path):
+            shutil.copyfile(path, f"{path}.bak.{int(time.time())}")
+
+    write_file(f"{cfg.bind_dir}/named.conf.options", render_named_conf_options(cfg))
+
+    os.makedirs("/var/log/named", exist_ok=True)
+    await run("chown", f"{cfg.bind_user}:{cfg.bind_user}", "/var/log/named")
+    os.chmod("/var/log/named", 0o755)
+    write_file(f"{cfg.bind_dir}/named.conf.logging", render_logging_conf())
+
+    write_file(f"{cfg.bind_dir}/named.conf.local", render_named_conf_local(cfg.use_rpz))
+
+    if cfg.use_rpz:
+        raw_file = "/var/lib/bind/db.rpz.adblock.raw"
+        txt_file = "/var/lib/bind/db.rpz.adblock.txt"
+        with tempfile.NamedTemporaryFile("w", delete=False) as tmp:
+            tmp.write(render_placeholder_zone())
+            zone_tmp = tmp.name
         try:
-            obtain_certificate(config.domain)
-        except SetupError as exc:
-            LOG.error("Certificate obtainment failed: %s", exc)
-            LOG.error("You can re-run with --skip-certbot after obtaining certs manually.")
-            sys.exit(1)
+            if not await run_ok(cfg.named_compilezone, "-f", "text", "-F", "raw", "-q",
+                                "-o", raw_file, "rpz.adblock", zone_tmp):
+                die("named-compilezone failed on placeholder zone.")
+        finally:
+            os.unlink(zone_tmp)
+        open(txt_file, "a").close()
+        await run("chown", f"{cfg.bind_user}:{cfg.bind_user}", raw_file, txt_file)
+        os.chmod(raw_file, 0o644)
+        os.chmod(txt_file, 0o644)
+        ok(f"Placeholder RPZ zone created ({raw_file}).")
 
-    # ---- Step 7: Install certificates ----
-    if config.domain:
-        try:
-            install_certificates(config)
-        except SetupError as exc:
-            LOG.error("Certificate installation failed: %s", exc)
-            LOG.exception("Details:")
-            sys.exit(1)
+    write_file(f"{cfg.bind_dir}/named.conf", render_named_conf())
 
-    # ---- Step 8: Write BIND configuration ----
-    try:
-        write_bind_config(config)
-    except SetupError as exc:
-        LOG.error("Config writing failed: %s", exc)
-        LOG.exception("Details:")
-        sys.exit(1)
+    if not await run_ok("named-checkconf", f"{cfg.bind_dir}/named.conf"):
+        die("named.conf validation failed! Check output above.")
+    ok("BIND configuration written and validated.")
 
-    # ---- Step 9: Setup RPZ ----
-    try:
-        setup_rpz(config)
-    except SetupError as exc:
-        LOG.error("RPZ setup failed: %s", exc)
-        LOG.exception("Details:")
-        # Non-fatal, continue
 
-    # ---- Step 10: Configure firewall ----
-    try:
-        configure_firewall(config)
-    except SetupError as exc:
-        LOG.warning("Firewall configuration issue: %s", exc)
+async def deploy_rpz(cfg: Config) -> None:
+    if not cfg.use_rpz:
+        return
+    header("Deploying RPZ auto-update")
+    rpz_script = "/etc/bind/update-rpz.sh"
+    write_file(rpz_script, render_rpz_script(), mode=0o750)
+    await run("chown", f"root:{cfg.bind_user}", rpz_script)
+    ok(f"RPZ update script deployed to {rpz_script}.")
 
-    # ---- Step 11: Start BIND ----
-    try:
-        start_bind()
-    except SetupError as exc:
-        LOG.error("Failed to start BIND: %s", exc)
-        LOG.error("Check 'journalctl -xeu named' for details.")
-        sys.exit(1)
+    write_file("/etc/systemd/system/rpz-updater.service",
+               render_rpz_service(rpz_script, cfg.bind_user))
+    write_file("/etc/systemd/system/rpz-updater.timer",
+               render_rpz_timer(cfg.rpz_timer))
+    await run("systemctl", "daemon-reload")
+    await run("systemctl", "enable", "--now", "rpz-updater.timer")
+    ok(f"systemd timer enabled: rpz-updater.timer ({cfg.rpz_timer}, ±5 min jitter).")
 
-    # ---- Step 12: Initial RPZ update ----
-    if config.use_rpz:
-        run_initial_rpz_update()
 
-    # ---- Step 13: Smoke test ----
-    try:
-        run_smoke_test(config.domain)
-    except SetupError as exc:
-        LOG.warning("Smoke test issue: %s", exc)
+async def setup_logrotate(cfg: Config) -> None:
+    write_file("/etc/logrotate.d/named-custom", render_logrotate(cfg.rndc))
 
-    # ---- Step 14: Summary ----
-    print_summary(config)
 
-    LOG.info("Setup complete. Enjoy your secure DNS resolver! 🎉")
+async def configure_firewall(cfg: Config) -> None:
+    header("Firewall")
+    ufw_active = False
+    if shutil.which("ufw"):
+        _, status = await run("ufw", "status", check=False, capture=True)
+        ufw_active = "Status: active" in status
+    if ufw_active:
+        await run_ok("ufw", "allow", "53/tcp", "comment", "DNS")
+        await run_ok("ufw", "allow", "53/udp", "comment", "DNS")
+        await run_ok("ufw", "allow", "853/tcp", "comment", "DoT")
+        if cfg.doh_enabled:
+            await run_ok("ufw", "allow", "443/tcp", "comment", "DoH")
+        await run_ok("ufw", "reload")
+        ok(f"UFW rules added (53, 853{', 443' if cfg.doh_enabled else ''}).")
+    elif shutil.which("iptables"):
+        warn("UFW not active. Adding iptables rules manually.")
+        await run_ok("iptables", "-I", "INPUT", "-p", "tcp", "--dport", "53", "-j", "ACCEPT")
+        await run_ok("iptables", "-I", "INPUT", "-p", "udp", "--dport", "53", "-j", "ACCEPT")
+        await run_ok("iptables", "-I", "INPUT", "-p", "tcp", "--dport", "853", "-j", "ACCEPT")
+        if cfg.doh_enabled:
+            await run_ok("iptables", "-I", "INPUT", "-p", "tcp", "--dport", "443", "-j", "ACCEPT")
+        warn("iptables rules are not persistent — install iptables-persistent to save them.")
+    else:
+        extra = ", 443/tcp" if cfg.doh_enabled else ""
+        warn(f"No firewall tool found. Open ports 53/tcp+udp, 853/tcp{extra} manually.")
+
+
+async def start_named(cfg: Config) -> None:
+    header("Starting BIND9")
+    await run("systemctl", "enable", "named")
+    await run("systemctl", "restart", "named")
+    await asyncio.sleep(2)
+    if not await run_ok("systemctl", "is-active", "--quiet", "named"):
+        die("named failed to start. Run: journalctl -xe -u named")
+    ok("named is running.")
+
+
+async def initial_rpz_update(cfg: Config) -> None:
+    if not cfg.use_rpz:
+        return
+    header("Running initial RPZ update")
+    info("Downloading hagezi pro blocklist via systemd service (may take a minute)...")
+    if await run_ok("systemctl", "start", "rpz-updater.service"):
+        ok("Initial RPZ update complete.")
+    else:
+        warn(f"Initial RPZ update failed. It will retry at the next timer trigger ({cfg.rpz_timer}).")
+        warn("Check logs: journalctl -u rpz-updater.service")
+        warn("Run manually: systemctl start rpz-updater.service")
+
+
+async def smoke_test(cfg: Config) -> None:
+    header("Smoke test")
+    if not shutil.which("dig"):
+        warn("dig not found — skipping smoke test.")
+        return
+    _, result = await run("dig", "+short", "+timeout=5", "@127.0.0.1",
+                          "example.com", "A", check=False, capture=True)
+    result = result.strip()
+    if result:
+        ok(f"dig @127.0.0.1 example.com → {result}")
+    else:
+        warn("DNS query returned empty result. Check named logs: journalctl -u named")
+
+
+def print_summary(cfg: Config, bind_ver: str) -> None:
+    print()
+    print(f"{BOLD}{GREEN}╔══════════════════════════════════════════╗")
+    print("║         Setup complete! ✓                ║")
+    print(f"╚══════════════════════════════════════════╝{NC}")
+    print()
+    print(f"  {BOLD}Plain DNS{NC}   →  {cfg.domain}:53  (TCP/UDP)")
+    print(f"  {BOLD}DNS-over-TLS{NC} →  {cfg.domain}:853")
+    if cfg.doh_enabled:
+        print(f"  {BOLD}DNS-over-HTTPS{NC} →  https://{cfg.domain}/dns-query")
+    print()
+    if cfg.install_mode == "source":
+        print(f"  {BOLD}BIND9:{NC}      {bind_ver} (built from source, prefix {cfg.bind_prefix})")
+    else:
+        print(f"  {BOLD}BIND9:{NC}      {bind_ver} (distro mirror)")
+    print()
+    print(f"  {BOLD}Config files:{NC}")
+    print(f"    {cfg.bind_dir}/named.conf.options")
+    print(f"    {cfg.bind_dir}/named.conf.local")
+    print(f"    {cfg.bind_dir}/named.conf.logging")
+    print(f"    {cfg.bind_ssl}/  (TLS certs)")
+    if cfg.use_rpz:
+        print()
+        print(f"  {BOLD}RPZ:{NC}")
+        print("    Update script: /etc/bind/update-rpz.sh")
+        print(f"    Timer:         {cfg.rpz_timer}  (±5 min jitter)")
+        print("    Logs:          journalctl -u rpz-updater.service")
+    print()
+    print(f"  {BOLD}Useful commands:{NC}")
+    print("    systemctl status named")
+    print("    journalctl -u named -f")
+    print(f"    named-checkconf {cfg.bind_dir}/named.conf")
+    print("    rndc status")
+    print("    certbot renew --dry-run")
+    if cfg.use_rpz:
+        print("    systemctl list-timers rpz-updater.timer")
+    print()
+
+
+async def sanity_checks() -> None:
+    if os.geteuid() != 0:
+        die(f"Run as root (sudo {sys.argv[0]}).")
+    if not os.path.isfile("/etc/debian_version"):
+        die("Only Debian/Ubuntu is supported.")
+
+
+async def main() -> None:
+    await sanity_checks()
+    cfg = Config()
+
+    # Kick off the (network-bound) version listing early so it overlaps prompts.
+    versions_task = asyncio.create_task(fetch_bind_versions())
+
+    await detect_existing_bind(cfg)
+    await gather_config(cfg, versions_task)
+    if not versions_task.done():
+        versions_task.cancel()
+
+    await install_packages(cfg)
+    if cfg.install_mode == "source":
+        await build_bind_from_source(cfg, cfg.bind_src_ver, cfg.bind_prefix)
+
+    await resolve_bind(cfg)
+    await obtain_certificate(cfg)
+    await write_bind_config(cfg)
+    await deploy_rpz(cfg)
+    await setup_logrotate(cfg)
+    await configure_firewall(cfg)
+    await start_named(cfg)
+    await initial_rpz_update(cfg)
+    await smoke_test(cfg)
+
+    _, vout = await run("named", "-v", check=False, capture=True)
+    parsed = parse_named_version(vout)
+    bind_ver = f"{parsed[0]}.{parsed[1]}" if parsed else "unknown"
+    print_summary(cfg, bind_ver)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        die("Interrupted.")
