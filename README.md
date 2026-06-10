@@ -144,3 +144,11 @@ uv pip install --python .venv/bin/python ruff pytest
 - Certificates renew automatically (cron for dnsdist, certbot deploy-hook for
   BIND); the service reloads only when a cert actually changes.
 - Building BIND from source can take several minutes.
+
+## Donations
+
+If you find this project useful, consider donating:
+
+- **TON network**: `UQB0t1EOgP2SZOfWK4HMZc_hda0lczGCJzH6-cvuv2ZuFhD7`
+- **TRC20 network**: `TYCRxNPqYv342hr4yDzYjm48ruAvL8joj4`
+- **BNB network**: `0x0E83d0d058B1A10F079D46fa70760068E305D6eB`
